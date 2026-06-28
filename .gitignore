@@ -1,0 +1,18 @@
+# 编译产物
+out/
+build/
+*.o
+*.obj
+*.exe
+*.out
+
+# IDE
+.vs/
+*.user
+*.suo
+.DS_Store
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
