@@ -18,6 +18,7 @@
 #include <string>
 #include <cstring>
 #include <vector>
+#include <cstring>
 #include <unordered_map>
 
 #include "socket_raii.h"
@@ -162,7 +163,7 @@ int main ()
                 std::string client_ip;
                 int client_port = 0;
                 Socket client_sock = listen_sock.Accept(client_ip, client_port);
-
+                if (client_sock.Fd() < 0) continue;
                 std::cout << "[+] 新客户端: " << client_ip << ":" << client_port << " (fd=" << client_sock.Fd() << ")" << std::endl;
 
                 client_sock.SetNonBlocking();

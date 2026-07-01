@@ -22,14 +22,16 @@ public:
 	{
 		wakeup_channel_ = std::make_unique<Channel>(wakeup_fd_, epoll_.get());
 		wakeup_channel_->SetReadCallback([this]() { HandleWakeup(); });
-		wakeup_channel_->EnableRead();
+		epoll_->Add(wakeup_fd_, 0);          // 先注册 fd（否则 EnableRead 里的 Mod 会失败）
+		wakeup_channel_->EnableRead();       // 再用 Mod 更新事件
 	}
 
 	~EventLoop()
 	{
+		wakeup_channel_.reset();  // 先析构 Channel（从 epoll 摘除）
 		if (wakeup_fd_ >= 0)
 		{
-			::close(wakeup_fd_);
+			::close(wakeup_fd_);  // 再关闭 fd
 		}
 	}
 
@@ -38,6 +40,7 @@ public:
 
 	void Loop()
 	{
+		tid_ = std::this_thread::get_id();
 		AssertInLoopThread();
 		looping_ = true;
 		quit_ = false;
@@ -132,7 +135,7 @@ public:
 	{
 		AssertInLoopThread();
 		channels_.erase(ch->Fd());
-		epoll_->Del(ch->Fd());
+		ch->DisableAll();  // 清零 events_，避免 ~Channel 重复 epoll_ctl(DEL)
 	}
 
 	Epoll* EpollPtr() const
@@ -172,7 +175,7 @@ private:
 		}
 	}
 
-	const std::thread::id tid_;
+	std::thread::id tid_;
 	std::unique_ptr<Epoll> epoll_;
 	std::mutex mutex_;
 	std::vector<Functor> pending_functors_;

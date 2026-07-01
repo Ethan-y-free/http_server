@@ -126,6 +126,7 @@ private:
         int port = 0;
 
         Socket client_sock = listen_sock_.Accept(ip, port);
+        if (client_sock.Fd() < 0) return;
         client_sock.SetNonBlocking();
 
         std::cout << "[+] 新客户端: " << ip << ":" << port << " (fd=" << client_sock.Fd() << ")" << std::endl;
@@ -156,7 +157,7 @@ private:
     void OnRead(int client_fd)
     {
         auto it = client_socks_.find(client_fd);
-        if (it == clients.end())
+        if (it == client_socks_.end())
         {
             return;
         }

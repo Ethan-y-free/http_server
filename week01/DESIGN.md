@@ -1699,3 +1699,997 @@ Day 11 是理解 Reactor 模式的关键一步——你写完就能感受到"IO 
 ### 12.11 参考文件
 
 `reference/single_reactor_server_full.cpp` — 完整参考实现。同样，**先根据 DESIGN.md 自己写，遇到困难再看参考**。
+
+---
+
+## 十三、主从 Reactor：MainReactor + SubReactor（Day 12 — 6/29）
+
+### 13.1 为什么需要主从 Reactor
+
+Day 11 单 Reactor 中，**accept 和所有客户端 IO 共用一个 EventLoop**。问题：
+
+- accept 是很快，但上千个连接的 IO 事件都在一个线程里轮询
+- 如果某个客户端的数据处理卡了一下（虽然不是阻塞，但 epoll_wait 返回后遍历事件也是开销）
+- 多核 CPU 下，只有一个线程做 IO 是浪费
+
+**主从 Reactor** 的思路：
+
+```
+MainReactor（主线程）           SubReactor[0..N-1]（工作线程）
+┌─────────────────┐          ┌─────────────────┐
+│ listen fd       │          │ client fd 1     │
+│   ↓             │          │ client fd 5     │
+│ accept          │──轮询──→│ client fd 9     │
+│ 新连接分发       │  分发    │   ↓             │
+└─────────────────┘          │ read/write/close│
+                             └─────────────────┘
+```
+
+- MainReactor **只负责 accept**，压力极小
+- SubReactor 每个线程一个 EventLoop（one loop per thread），负责客户端 IO
+- 新连接 Round-Robin 分发给 SubReactor
+
+### 13.2 架构数据流
+
+```
+客户端 → TCP → MainReactor(accept)
+                    │
+                    │ Round-Robin 选 SubReactor
+                    ▼
+              SubReactor[N]（IO 线程）
+                    │
+                    │ read 数据
+                    ▼
+              ThreadPool（计算线程）
+                    │
+                    │ 处理完 → RunInLoop 回到 SubReactor
+                    ▼
+              SubReactor[N]（IO 线程）
+                    │
+                    │ write 响应
+                    ▼
+                 客户端
+```
+
+### 13.3 API 清单
+
+```cpp
+class MultiReactorServer
+{
+public:
+    // === 构造/析构 ===
+    MultiReactorServer(EventLoop* mainLoop, uint16_t port, int subReactorCount, ThreadPool* pool);
+    ~MultiReactorServer();
+
+    // 禁止拷贝/移动
+    MultiReactorServer(const MultiReactorServer&) = delete;
+    MultiReactorServer& operator=(const MultiReactorServer&) = delete;
+
+private:
+    // === MainReactor 回调：只在主线程执行 ===
+    void OnAccept();
+
+    // === SubReactor 回调：在归属的 SubReactor 线程执行 ===
+    void OnRead  (int fd, EventLoop* subLoop);
+    void OnWrite (int fd, EventLoop* subLoop);
+    void OnClose (int fd, EventLoop* subLoop);
+    void OnError (int fd, EventLoop* subLoop);
+
+    // === 工具方法 ===
+    void FlushWrite        (int fd);  // 非阻塞写回（SubReactor 线程）
+    void RemoveClientChannel(int fd);  // 从 epoll 移除 Channel（SubReactor 线程）
+
+    // === 数据结构 ===
+    struct Connection
+    {
+        Socket sock;
+        std::unique_ptr<Channel> channel;
+        Buffer inputBuffer;
+        Buffer outputBuffer;
+        EventLoop* ownerLoop;  // 归属哪个 SubReactor
+    };
+
+    // === Reactor 成员 ===
+    EventLoop*                          mainLoop_;   // 主Reactor（不拥有）
+    std::vector<std::unique_ptr<EventLoop>> subLoops_;  // SubReactor列表（拥有）
+    std::vector<std::thread>            subThreads_;  // SubReactor线程
+    ThreadPool*                         pool_;       // 计算线程池（不拥有）
+
+    // === 监听 ===
+    Socket                    listenSock_;
+    std::unique_ptr<Channel>  listenChannel_;
+
+    // === 客户端管理 ===
+    std::unordered_map<int, Connection>  clients_;
+    std::mutex                           clientsMutex_;
+    std::atomic<int>                     nextSubReactor_{0};  // Round-Robin
+};
+```
+
+| 成员 | 类型 | 说明 |
+|------|------|------|
+| `MultiReactorServer(loop, port, N, pool)` | 构造 | N=SubReactor数量=CPU核心数 |
+| `~MultiReactorServer()` | 析构 | ①移除所有Channel → ②Quit所有SubReactor → ③join线程 |
+| `OnAccept()` | MainReactor | accept → Round-Robin → subLoop->RunInLoop(注册Channel) |
+| `OnRead(fd, sub)` | SubReactor | 读数据 → 拷到outputBuffer → 投ThreadPool → sub->RunInLoop(FlushWrite) |
+| `OnWrite(fd, sub)` | SubReactor | 直接调FlushWrite |
+| `OnClose(fd, sub)` | SubReactor | RemoveChannel + erase(clients_) |
+| `OnError(fd, sub)` | SubReactor | 转调OnClose |
+| `FlushWrite(fd)` | SubReactor | 非阻塞send，EAGAIN时EnableWrite等下次 |
+| `RemoveClientChannel(fd)` | SubReactor | 从ownerLoop的epoll中Del |
+
+### 13.4 关键设计点
+
+#### ① 每个 SubReactor 是独立的 EventLoop 线程
+
+```cpp
+// 构造函数中启动 N 个 SubReactor 线程
+for (int i = 0; i < subReactorCount; ++i)
+{
+    subLoops_[i] = std::make_unique<EventLoop>();
+    subThreads_.emplace_back([this, i]() {
+        subLoops_[i]->Loop();  // 阻塞在这里，直到 Quit()
+    });
+}
+```
+
+每个 SubReactor 在自己的线程里跑 `EventLoop::Loop()`，互不干扰。
+
+#### ② Connection 需要知道归属哪个 SubReactor
+
+```cpp
+struct Connection
+{
+    Socket sock;
+    std::unique_ptr<Channel> channel;
+    Buffer inputBuffer;
+    Buffer outputBuffer;
+    EventLoop* ownerLoop;  // ← 新增：归属哪个 SubReactor
+};
+```
+
+Channel 的 Epoll 指针必须指向 `ownerLoop` 的 Epoll。
+
+#### ③ MainReactor::OnAccept 分发连接
+
+```cpp
+void OnAccept()
+{
+    Socket clientSock = listenSock_.Accept(ip, port);
+    clientSock.SetNonBlocking();
+
+    // Round-Robin 选 SubReactor
+    int idx = nextSubReactor_.fetch_add(1) % subLoops_.size();
+    EventLoop* subLoop = subLoops_[idx].get();
+
+    // 创建 Connection（Channel 指向 SubReactor 的 Epoll）
+    Connection conn;
+    conn.channel = std::make_unique<Channel>(fd, subLoop->EpollPtr());
+    conn.ownerLoop = subLoop;
+
+    // 回调捕获 subLoop
+    conn.channel->SetReadCallback([this, fd, sub = subLoop]() { OnRead(fd, sub); });
+    // ... 其他回调同理 ...
+
+    // 插入 clients_（需要 mutex）
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex_);
+        clients_.emplace(fd, std::move(conn));
+    }
+
+    // 在 SubReactor 线程中注册 Channel
+    subLoop->RunInLoop([this, fd]() {
+        auto it = clients_.find(fd);
+        if (it != clients_.end()) {
+            it->second.ownerLoop->AddChannel(it->second.channel.get());
+            it->second.channel->EnableRead();
+        }
+    });
+}
+```
+
+#### ④ ThreadPool 回调回到 SubReactor
+
+单 Reactor 里 ThreadPool 回调通过 `loop_->RunInLoop(...)` 回到主 EventLoop。
+
+主从 Reactor 里，回调要回到**该连接归属的 SubReactor**：
+
+```cpp
+void OnRead(int fd, EventLoop* subLoop)
+{
+    // ... 读数据，拷贝到 outputBuffer ...
+
+    pool_->Run([this, fd, subLoop]() {
+        // 在计算线程中
+        subLoop->RunInLoop([this, fd]() {
+            FlushWrite(fd);  // 回到 SubReactor IO 线程写
+        });
+    });
+}
+```
+
+#### ⑤ clients_ 的线程安全
+
+- `OnAccept` 在 MainReactor 线程写入 `clients_`
+- `OnClose` 在 SubReactor 线程删除 `clients_`
+- 因此需要 `std::mutex clientsMutex_` 保护
+
+#### ⑥ 优雅关闭
+
+析构顺序：
+1. 遍历 clients_，通知各 SubReactor 移除 Channel
+2. 移除 listen Channel
+3. `Quit()` 所有 SubReactor
+4. `join()` 所有 SubReactor 线程
+
+### 13.5 类结构
+
+```
+MultiReactorServer
+├── mainLoop_            EventLoop*          主 Reactor（不拥有）
+├── subLoops_            vector<unique_ptr>  SubReactor 列表（拥有）
+├── subThreads_          vector<thread>      SubReactor 线程
+├── pool_                ThreadPool*         计算线程池（不拥有）
+│
+├── listenSock_          Socket             监听 socket
+├── listenChannel_       unique_ptr<Channel> 监听 Channel
+│
+├── clients_             unordered_map       所有客户端连接
+├── clientsMutex_        mutex               clients_ 的锁
+└── nextSubReactor_      atomic<int>         Round-Robin 计数器
+```
+
+### 13.6 与 Day 11 单 Reactor 的核心差异
+
+| | Day 11 单 Reactor | Day 12 主从 Reactor |
+|---|---|---|
+| EventLoop 数量 | 1 | 1 + N |
+| accept 线程 | EventLoop 线程 | MainReactor 线程 |
+| IO 线程 | EventLoop 线程 | SubReactor 线程 |
+| accept 后 | 直接 AddChannel | Round-Robin → subLoop->RunInLoop(AddChannel) |
+| Channel 的 Epoll* | mainLoop_->EpollPtr() | subLoop->EpollPtr() |
+| ThreadPool 回调 | loop_->RunInLoop() | subLoop->RunInLoop() |
+| clients_ | 无锁（单线程） | 有锁（多线程） |
+| 关闭 | Quit mainLoop | Quit 所有 subLoop → join 线程 |
+
+### 13.7 实现要点
+
+1. **先启动 SubReactor 线程，再创建 MultiReactorServer**（或构造时启动）。SubReactor 必须先 Loop 起来，否则 OnAccept 分发时 `RunInLoop` 写 eventfd 会失败。
+
+2. **Channel 必须用 SubReactor 的 EpollPtr**。如果在 OnAccept 里用了 mainLoop 的 Epoll，Channel 就会注册到错误的 epoll 实例。
+
+3. **回调里捕获 `subLoop`**。每个 Connection 的回调（OnRead/OnWrite/OnClose/OnError）都需要知道归属的 SubReactor，用于 ThreadPool 回调时的 `RunInLoop`。
+
+4. **OnClose 的线程安全**。OnClose 在 SubReactor 线程执行，但 clients_ 的写入（OnAccept）在主线程。所以 `clients_.erase(fd)` 必须加锁。
+
+5. **禁止拷贝 EventLoop**。`EventLoop(const EventLoop&) = delete`，所以用 `vector<unique_ptr<EventLoop>>` 来管理 SubReactor。
+
+### 13.8 测试方法
+
+```bash
+# 终端1：启动服务器
+cd build && cmake .. && make multi_reactor_server && ./multi_reactor_server
+
+# 终端2-5：模拟多客户端
+nc localhost 8888
+nc localhost 8888
+nc localhost 8888
+nc localhost 8888
+
+# 观察输出：不同连接应该分布到不同 SubReactor
+# [recv 5B fd=6 via SubReactor] hello
+# [recv 5B fd=7 via SubReactor] world
+```
+
+### 13.9 参考文件
+
+`reference/multi_reactor_server_full.cpp` — 完整参考实现。**先根据 DESIGN.md 自己写，遇到困难再看参考。**
+
+---
+
+# 十四、HTTP 请求解析（状态机）
+
+> **Day 13 目标**：实现一个增量式 HTTP/1.1 请求解析器，用有限状态机从字节流中提取 method、path、headers、body。
+
+---
+
+## 14.1 为什么需要状态机
+
+TCP 是字节流，客户端的一整条 HTTP 请求可能被拆成多个 TCP 段到达：
+
+```
+客户端发送: "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                   │
+    ┌──────────────┼──────────────┐
+    ▼              ▼              ▼
+ 段1: "GET / H"   段2: "TTP/1.1\r"   段3: "\nHost: loca..."
+```
+
+回调里每次 `read()` 拿到的只是一段数据。状态机记住"当前解析到哪了"，每次新数据到达时接着解析。
+
+---
+
+## 14.2 HTTP/1.1 请求格式
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ 请求行 (Request Line)                                    │
+│ GET /index.html HTTP/1.1\r\n                             │
+├─────────────────────────────────────────────────────────┤
+│ 请求头 (Headers)                                         │
+│ Host: www.example.com\r\n                                │
+│ Connection: keep-alive\r\n                               │
+│ Content-Length: 13\r\n                                   │
+│ \r\n                      ← 空行标记 headers 结束         │
+├─────────────────────────────────────────────────────────┤
+│ 请求体 (Body) — 仅 POST/PUT 等有                         │
+│ Hello, World!                                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 请求行格式
+
+```
+METHOD SP PATH SP VERSION CRLF
+  │      │      │       │
+  │      │      │       └─ HTTP/1.1 或 HTTP/1.0
+  │      │      └─ 空格分隔
+  │      └─ /index.html?a=1  (含 query string)
+  └─ GET / POST / HEAD
+```
+
+- **METHOD**：大小写敏感，常见 GET / POST / HEAD
+- **PATH**：以 `/` 开头，可能包含 `?query=string`
+- **VERSION**：`HTTP/1.1` 或 `HTTP/1.0`
+- 三项之间用**单个空格**分隔，行末 `\r\n`
+
+### 请求头格式
+
+```
+Key: Value\r\n
+```
+
+- Key 不区分大小写（习惯首字母大写）
+- `:` 后面有一个空格
+- 空行 `\r\n` 表示 headers 结束
+
+### 请求体
+
+- 只在 POST/PUT 等有请求体时存在
+- 长度由 `Content-Length` 头决定
+- 没有 `Content-Length` → 无 body（GET 请求）
+
+---
+
+## 14.3 状态机设计
+
+```
+                    ┌──────────┐
+       new data ──→ │  START   │
+                    └────┬─────┘
+                         │
+              ┌──────────▼──────────┐
+              │  PARSE_REQUEST_LINE  │  逐字节扫描，找第一个 \r\n
+              └──────────┬──────────┘
+                         │ 找到完整请求行
+              ┌──────────▼──────────┐
+              │    PARSE_HEADERS     │  逐行解析 Key: Value
+              └──────────┬──────────┘
+                         │ 遇到空行 \r\n
+              ┌──────────▼──────────┐
+              │    PARSE_BODY        │  按 Content-Length 读取
+              └──────────┬──────────┘
+                         │ body 读完 / 无 body
+              ┌──────────▼──────────┐
+              │    PARSE_DONE        │  完整请求已就绪
+              └─────────────────────┘
+```
+
+**关键规则**：任何状态下数据不足 → 返回"需要更多数据"，状态不变，下次新数据到达时从同一状态继续。
+
+---
+
+## 14.4 数据结构
+
+### HttpRequest（解析结果）
+
+#### 文件：`http_request.h`
+
+#### 职责
+
+保存一条 HTTP 请求的完整结构化数据。由 `HttpRequestParser` 填充，由服务器读取并做决策。
+
+#### API 清单
+
+| 分类 | 方法 | 说明 |
+|------|------|------|
+| Setter | `SetMethod(m)` | 设置请求方法（GET/POST/HEAD） |
+| Setter | `SetPath(p)` | 设置请求路径 |
+| Setter | `SetVersion(v)` | 设置 HTTP 版本 |
+| Setter | `AddHeader(key, value)` | 添加一个请求头键值对 |
+| Setter | `AppendBody(data, len)` | 追加请求体数据 |
+| Getter | `GetMethod()` → `const string&` | 获取请求方法 |
+| Getter | `GetPath()` → `const string&` | 获取请求路径 |
+| Getter | `GetVersion()` → `const string&` | 获取 HTTP 版本 |
+| Getter | `GetBody()` → `const string&` | 获取请求体 |
+| 查询 | `GetHeader(key)` → `string` | 大小写不敏感查找 header 值 |
+| 查询 | `IsKeepAlive()` → `bool` | 是否长连接 |
+| 查询 | `ContentLength()` → `size_t` | Content-Length 值，无则返回 0 |
+| 管理 | `Reset()` | 清空所有字段 |
+
+#### API 签名
+
+```cpp
+class HttpRequest
+{
+public:
+    // Setters（由解析器调用）
+    void SetMethod(const std::string& m);
+    void SetPath(const std::string& p);
+    void SetVersion(const std::string& v);
+    void AddHeader(const std::string& key, const std::string& value);
+    void AppendBody(const char* data, size_t len);
+
+    // Getters
+    const std::string& GetMethod()  const;
+    const std::string& GetPath()    const;
+    const std::string& GetVersion() const;
+    const std::string& GetBody()    const;
+
+    // 查询
+    std::string GetHeader(const std::string& key) const;
+    bool IsKeepAlive() const;
+    size_t ContentLength() const;
+
+    // 管理
+    void Reset();
+
+private:
+    std::string method_;
+    std::string path_;
+    std::string version_;
+    std::unordered_map<std::string, std::string> headers_;
+    std::string body_;
+};
+```
+
+#### 设计说明
+
+- **IsKeepAlive()**：`HTTP/1.1` 默认长连接（`Connection: close` 时关闭），`HTTP/1.0` 默认短连接（`Connection: keep-alive` 时保持）
+- **GetHeader()**：header 名称大小写不敏感（RFC 7230 §3.2）
+- **ContentLength()**：查 `Content-Length` header，无则返回 0（GET 请求没有 body）
+
+> **为什么 header key 用大小写不敏感比较**：客户端可能发 `Content-Length` 或 `content-length` 或 `CONTENT-LENGTH`，RFC 7230 §3.2 规定 header 名称大小写不敏感。
+
+---
+
+## 14.5 HttpRequestParser API
+
+#### 文件：`http_parser.h`
+
+#### 职责
+
+增量式 HTTP/1.1 请求解析器。内部用有限状态机记录解析进度，每次 `Parse()` 从 Buffer 消费已解析的字节。可 `Reset()` 后重用（支持长连接多请求场景）。
+
+#### API 清单
+
+| 分类 | 方法 | 说明 |
+|------|------|------|
+| 核心 | `Parse(buffer)` → `ParseResult` | 喂数据，推进状态机，消费 buffer 中已解析字节 |
+| 查询 | `IsDone()` → `bool` | 解析是否完成（状态 == PARSE_DONE） |
+| 查询 | `CurrentState()` → `State` | 当前状态（调试用） |
+| 查询 | `GetRequest()` → `const HttpRequest&` | 获取解析结果 |
+| 管理 | `Reset()` | 重置状态机，准备解析下一个请求 |
+
+#### 枚举定义
+
+```cpp
+enum State {
+    PARSE_REQUEST_LINE,   // 正在解析请求行
+    PARSE_HEADERS,        // 正在解析请求头
+    PARSE_BODY,           // 正在解析请求体
+    PARSE_DONE            // 解析完成
+};
+
+enum ParseResult {
+    PARSE_OK,             // 状态推进了一步
+    PARSE_NEED_MORE,      // 数据不足，等待下次 read
+    PARSE_ERROR           // 协议错误
+};
+```
+
+#### API 签名
+
+```cpp
+class HttpRequestParser
+{
+public:
+    enum State { PARSE_REQUEST_LINE, PARSE_HEADERS, PARSE_BODY, PARSE_DONE };
+    enum ParseResult { PARSE_OK, PARSE_NEED_MORE, PARSE_ERROR };
+
+    ParseResult Parse(Buffer* buffer);
+    bool IsDone() const;
+    State CurrentState() const;
+    const HttpRequest& GetRequest() const;
+    void Reset();
+
+private:
+    ParseResult ParseRequestLine(Buffer* buffer);
+    ParseResult ParseHeaders(Buffer* buffer);
+    ParseResult ParseBody(Buffer* buffer);
+
+    State state_ = PARSE_REQUEST_LINE;
+    HttpRequest request_;
+    size_t bodyRead_ = 0;
+};
+```
+
+#### 设计决策
+
+1. **增量解析**：`Parse()` 可多次调用，不够返回 `PARSE_NEED_MORE`，状态不变
+2. **消费式**：从 `Buffer::Peek()` 查看数据，解析后用 `Retrieve(n)` 消费，不额外拷贝
+3. **可重用**：`Reset()` 后解析下一个请求（HTTP keep-alive 长连接）
+4. **Fail-fast**：协议错误立即返回 `PARSE_ERROR`，调用方关闭连接
+
+---
+
+## 14.6 各状态的解析算法
+
+### 14.6.1 ParseRequestLine
+
+```
+输入: buffer（至少含部分请求行数据）
+
+算法:
+1. 在 buffer 中查找 \r\n
+   ├── 找不到 → 返回 PARSE_NEED_MORE
+   └── 找到 → 继续
+2. 提取行内容（不含 \r\n）
+3. 按空格拆分为 method, path, version（恰好 3 段）
+   ├── 段数不对 → 返回 PARSE_ERROR
+   └── 正确 → 继续
+4. 验证 method 是已知方法（GET/POST/HEAD）
+   ├── 不支持 → 返回 PARSE_ERROR
+   └── 支持 → 继续
+5. 验证 path 以 '/' 开头
+   ├── 不是 → 返回 PARSE_ERROR
+   └── 是 → 继续
+6. 存入 request_
+7. Retrieve 掉整行（含 \r\n）
+8. 状态切换 → PARSE_HEADERS
+9. 返回 PARSE_OK
+```
+
+**复杂度**：O(n)，n = 请求行长（通常 < 100 字节）。
+
+### 14.6.2 ParseHeaders
+
+```
+输入: buffer（至少含部分 header 数据）
+
+算法:
+循环:
+  1. 在 buffer 中查找 \r\n
+     ├── 找不到 → 返回 PARSE_NEED_MORE
+     └── 找到 → 继续
+  2. 提取行内容
+  3. 如果行为空（即 \r\n 就是空行）:
+     ├── headers 结束
+     ├── Retrieve 掉 2 字节（\r\n）
+     ├── 检查 Content-Length
+     │   ├── > 0 → 切换到 PARSE_BODY
+     │   └── = 0 或不存在 → 切换到 PARSE_DONE
+     └── 返回 PARSE_OK
+  4. 解析 "Key: Value" 格式
+     ├── 找不到 ':' → 返回 PARSE_ERROR
+     ├── value 以空格开头 → 去掉前导空格
+     └── 存入 request_.headers[key] = value
+  5. Retrieve 掉这行（含 \r\n）
+  6. 继续循环
+```
+
+**复杂度**：O(n)，n = headers 段总长（通常 < 2KB）。
+
+> **注意**：每行最多不超过 `MAX_HEADER_LINE`（建议 8192 字节），防止恶意客户端发超长 header 耗尽内存。
+
+### 14.6.3 ParseBody
+
+```
+输入: buffer
+
+算法:
+1. 计算还需读取的字节数: remain = contentLength - bodyRead_
+2. buffer 中可读字节数: avail = buffer.ReadableBytes()
+3. 比较:
+   ├── avail >= remain → 可以读完
+   │   ├── body.append(buffer.Peek(), remain)
+   │   ├── buffer.Retrieve(remain)
+   │   ├── 切换到 PARSE_DONE
+   │   └── 返回 PARSE_OK
+   └── avail < remain → 不够
+       ├── body.append(buffer.Peek(), avail)
+       ├── bodyRead_ += avail
+       ├── buffer.Retrieve(avail)
+       └── 返回 PARSE_NEED_MORE
+```
+
+**复杂度**：O(n)，n = body 长度。
+
+---
+
+## 14.7 与服务器集成
+
+### 修改 OnRead 回调
+
+当前 echo 逻辑：
+
+```cpp
+// 旧: echo — 读到什么就回什么
+conn.outputBuffer.Append(conn.inputBuffer.Peek(), conn.inputBuffer.ReadableBytes());
+conn.inputBuffer.RetrieveAll();
+```
+
+改为 HTTP 解析：
+
+```cpp
+// 新: HTTP 解析 → 生成响应
+auto result = conn.parser.Parse(&conn.inputBuffer);
+
+if (result == HttpRequestParser::PARSE_ERROR)
+{
+    shouldClose = true;
+}
+else if (result == HttpRequestParser::PARSE_OK && conn.parser.IsDone())
+{
+    // 解析完成，生成 HTTP 响应
+    GenerateResponse(conn.parser.GetRequest(), &conn.outputBuffer);
+
+    if (!conn.parser.GetRequest().IsKeepAlive())
+    {
+        shouldClose = true;  // 短连接，响应后关闭
+    }
+    else
+    {
+        conn.parser.Reset(); // 长连接，重置解析器等下一个请求
+    }
+}
+// else: PARSE_NEED_MORE → 等下次事件
+```
+
+### Connection 结构体新增字段
+
+```cpp
+struct Connection
+{
+    Socket sock;
+    std::unique_ptr<Channel> channel;
+    Buffer inputBuffer;
+    Buffer outputBuffer;
+    EventLoop* ownerLoop;
+    HttpRequestParser parser;    // ← 新增
+};
+```
+
+### 完整数据流
+
+```
+客户端 TCP 段到达
+    │
+    ▼
+epoll_wait 返回 EPOLLIN
+    │
+    ▼
+OnRead(fd)
+    │
+    ├─ inputBuffer.ReadFd(fd)      // 从内核读到 Buffer
+    │
+    ├─ parser.Parse(&inputBuffer)  // 喂给状态机
+    │       │
+    │       ├─ 不足 → return
+    │       ├─ 错误 → OnClose
+    │       └─ DONE → GenerateResponse()
+    │
+    ├─ outputBuffer ← HTTP 响应
+    │
+    └─ FlushWrite(fd)              // 非阻塞写回客户端
+```
+
+---
+
+## 14.8 HTTP 响应生成（最简版）
+
+Day 13 只需返回一个最简单的 HTTP 响应来验证解析正确：
+
+```cpp
+void GenerateResponse(const HttpRequest& req, Buffer* output)
+{
+    std::string body;
+    std::string status;
+
+    if (req.GetMethod() == "GET" || req.GetMethod() == "HEAD")
+    {
+        status = "200 OK";
+        body = "<html><body><h1>Hello from http_server!</h1>"
+               "<p>Path: " + req.GetPath() + "</p>"
+               "<p>Method: " + req.GetMethod() + "</p>"
+               "</body></html>";
+    }
+    else if (req.GetMethod() == "POST")
+    {
+        status = "200 OK";
+        body = "<html><body><h1>POST received</h1>"
+               "<p>Body: " + req.GetBody() + "</p>"
+               "</body></html>";
+    }
+    else
+    {
+        status = "405 Method Not Allowed";
+        body = "<html><body><h1>405 Method Not Allowed</h1></body></html>";
+    }
+
+    char buf[4096];
+    int len;
+    if (req.GetMethod() == "HEAD")
+    {
+        len = snprintf(buf, sizeof(buf),
+            "%s %s\r\n"
+            "Server: tiny-http/1.0\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: %s\r\n"
+            "\r\n",
+            req.GetVersion().c_str(), status.c_str(),
+            body.size(),
+            req.IsKeepAlive() ? "keep-alive" : "close");
+    }
+    else
+    {
+        len = snprintf(buf, sizeof(buf),
+            "%s %s\r\n"
+            "Server: tiny-http/1.0\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: %s\r\n"
+            "\r\n"
+            "%s",
+            req.GetVersion().c_str(), status.c_str(),
+            body.size(),
+            req.IsKeepAlive() ? "keep-alive" : "close",
+            body.c_str());
+    }
+
+    output->Append(buf, len);
+}
+```
+
+> Day 15 会实现完整的静态文件服务 + 404/500 处理，Day 13 只需这个最简版验证解析器正确。
+
+---
+
+## 14.9 文件规划
+
+```
+week01/
+├── http_request.h     ← HttpRequest 数据结构（~70 行）
+├── http_parser.h      ← HttpRequestParser 状态机（~120 行）
+├── multi_reactor_server.cpp  ← 修改：OnRead 集成解析器 + GenerateResponse
+│                                （新增 ~80 行，改动 ~20 行）
+└── CMakeLists.txt     ← 无需改动（头文件自动生效）
+```
+
+> **Day 13 只需写两个头文件 `http_request.h` + `http_parser.h`，改一个 `.cpp`。**
+> **所有类都是 header-only，无需改 CMakeLists.txt。**
+
+---
+
+## 14.10 API 清单汇总
+
+| 类型 | 方法 | 说明 |
+|------|------|------|
+| `HttpRequest::Reset()` | void | 清空所有字段，准备下一次解析 |
+| `HttpRequest::GetHeader(key)` | string | 大小写不敏感查找 header 值 |
+| `HttpRequest::IsKeepAlive()` | bool | 判断是否长连接 |
+| `HttpRequest::ContentLength()` | size_t | 返回 Content-Length 值（无则 0） |
+| | | |
+| `HttpRequestParser::Parse(buffer)` | ParseResult | 核心方法：增量解析，推进状态机 |
+| `HttpRequestParser::IsDone()` | bool | 解析是否完成 |
+| `HttpRequestParser::GetRequest()` | const HttpRequest& | 获取解析结果 |
+| `HttpRequestParser::Reset()` | void | 重置状态机，准备解析下一个请求 |
+| `HttpRequestParser::CurrentState()` | State | 查询当前状态（调试用） |
+
+---
+
+## 14.11 测试方法
+
+### 浏览器测试
+
+```bash
+# 终端1: 启动服务器
+cd build && cmake .. && make multi_reactor_server && ./multi_reactor_server
+
+# 浏览器打开: http://localhost:8888/
+# 应该看到 "Hello from http_server!" 页面
+# 浏览器打开: http://localhost:8888/test.html
+# Path 显示 /test.html
+```
+
+### curl 测试
+
+```bash
+# GET 请求
+curl -v http://localhost:8888/
+
+# POST 请求
+curl -v -X POST http://localhost:8888/ -d "hello world"
+
+# 查看 keep-alive 行为
+curl -v http://localhost:8888/ http://localhost:8888/
+
+# HEAD 请求
+curl -v -X HEAD http://localhost:8888/
+```
+
+### nc 手动构造请求
+
+```bash
+nc localhost 8888
+GET / HTTP/1.1\r\n
+Host: localhost\r\n
+\r\n
+# 应返回 HTTP/1.1 200 OK + HTML body
+```
+
+---
+
+## 14.12 小结：你需要做的事
+
+1. **新建 `http_request.h`**：实现 `HttpRequest` 结构体（照 §14.4 API）
+2. **新建 `http_parser.h`**：实现 `HttpRequestParser` 类（照 §14.5 API + §14.6 算法）
+3. **修改 `multi_reactor_server.cpp`**：
+   - `Connection` 加 `HttpRequestParser parser` 成员
+   - `OnRead` 中：数据到达 → `parser.Parse()` → 完成后调用 `GenerateResponse()`
+   - 添加 `GenerateResponse()` 函数（照 §14.8）
+   - 长连接：`IsKeepAlive()` 为 true 时 `parser.Reset()`；否则 `OnClose`
+4. **编译运行**：`cd build && cmake .. && make multi_reactor_server && ./multi_reactor_server`
+5. **浏览器访问 `http://localhost:8888/`** 看到 HTML 页面即为成功 ✅
+
+> **参考文件**：`reference/http_request_full.h` + `reference/http_parser_full.h` + `reference/multi_reactor_http_full.cpp`
+
+---
+
+# 十五、Week 4 周总结 + 压测对比
+
+> **Day 14 目标**：对单 Reactor 和主从 Reactor 做压测对比，记录 QPS 数据，总结 Week 4 全部产出。
+
+---
+
+## 15.1 压测环境
+
+| 项目 | 值 |
+|------|-----|
+| 虚拟机 | VMware Ubuntu |
+| CPU | 4 核 |
+| 内存 | 8G（分配） |
+| 工具 | ApacheBench (`ab`) |
+| 测试命令 | `ab -n 100000 -c 100 http://127.0.0.1:8888/` |
+| 参数含义 | `-n 100000` 总共 10 万请求，`-c 100` 100 并发连接 |
+
+---
+
+## 15.2 待测目标
+
+| # | 目标 | 架构 | 说明 |
+|---|------|------|------|
+| A | `single_reactor_server` | 1 EventLoop + ThreadPool | 单线程 IO，计算投线程池 |
+| B | `multi_reactor_http` | MainReactor + 4 SubReactor + ThreadPool | 主从 IO，计算投线程池 |
+
+---
+
+## 15.3 测试步骤
+
+```bash
+# ① 编译
+cd build && cmake .. && make single_reactor_server multi_reactor_http
+
+# ② 测试目标 A：单 Reactor
+./week01/single_reactor_server &
+ab -n 100000 -c 100 http://127.0.0.1:8888/ > result_single.txt
+fuser -k 8888/tcp
+
+# ③ 测试目标 B：主从 Reactor HTTP
+./week01/multi_reactor_http &
+ab -n 100000 -c 100 http://127.0.0.1:8888/ > result_multi.txt
+fuser -k 8888/tcp
+
+# ④ 也可以测不同并发级别
+for c in 10 50 100 500 1000; do
+    ./week01/multi_reactor_http &
+    ab -n 100000 -c $c http://127.0.0.1:8888/ > result_multi_c${c}.txt
+    fuser -k 8888/tcp
+done
+```
+
+---
+
+## 15.4 关注指标
+
+从 `ab` 输出中提取：
+
+| 指标 | 含义 |
+|------|------|
+| Requests per second | **QPS** — 最核心的指标 |
+| Time per request (mean) | 平均响应时间 |
+| Failed requests | 失败数（应为 0） |
+| Transfer rate | 吞吐量 KB/s |
+
+---
+
+## 15.5 预期结果
+
+| | 单 Reactor | 主从 Reactor | 差异 |
+|---|---|---|---|
+| QPS | ~2-3 万 | ~4-6 万 | 主从约 2x |
+| 原因 | 单线程 accept + IO，epoll_wait 下 accept 惊群效应少但 IO 瓶颈 | accept 和 IO 分离，4 个 SubReactor 分摊 IO |
+
+> **路线图目标**：主从 Reactor 模式跑通，Webbench 压测 > 3 万 QPS。
+
+---
+
+## 15.6 Week 4 完成清单
+
+| Day | 内容 | 状态 |
+|-----|------|------|
+| Day 8 | Reactor 模式概念理解 | ✅ |
+| Day 9 | EventLoop 类实现 | ✅ |
+| Day 10 | ThreadPool 类实现 | ✅ |
+| Day 11 | 单 Reactor Echo Server | ✅ |
+| Day 12 | 主从 Reactor Echo Server | ✅ |
+| Day 13 | HTTP 请求解析（状态机） | ✅ |
+| Day 14 | 压测对比 + 周总结 | ⬜ |
+
+### Week 4 新增文件
+
+```
+week01/
+├── eventloop.h              # EventLoop：one loop per thread 核心
+├── threadpool.h             # ThreadPool：C++11 线程池
+├── single_reactor_server.cpp  # 单 Reactor：1 EventLoop + ThreadPool
+├── multi_reactor_server.cpp   # 主从 Reactor：Main + N Sub
+├── http_request.h           # HttpRequest 数据结构
+├── http_parser.h            # HTTP/1.1 状态机解析器
+└── multi_reactor_http.cpp   # 主从 Reactor HTTP Server（集大成）
+```
+
+### Week 4 核心架构
+
+```
+                    MainReactor (EventLoop ×1)
+                    ┌──────────────────────┐
+                    │  监听 socket          │
+                    │  accept() 新连接      │
+                    │  Round-Robin 分发     │
+                    └──┬────┬────┬────┬────┘
+                       │    │    │    │
+              ┌────────▼────▼────▼────▼────────┐
+              │     SubReactor (EventLoop ×N)   │
+              │  ┌──────┐ ┌──────┐ ┌──────┐    │
+              │  │  fd1  │ │  fd2  │ │  fd3  │    │
+              │  │  IO   │ │  IO   │ │  IO   │    │
+              │  └──┬───┘ └──┬───┘ └──┬───┘    │
+              └─────┼────────┼────────┼────────┘
+                    │        │        │
+              ┌─────▼────────▼────────▼────────┐
+              │      ThreadPool (计算线程池)     │
+              │  HTTP 解析 → 生成响应 → 写回    │
+              └────────────────────────────────┘
+```
+
+---
+
+## 15.7 Day 14 任务清单
+
+1. **VM 安装 ab**：`sudo apt install apache2-utils -y`
+2. **跑基准测试**：单 Reactor vs 主从 Reactor，记录 QPS 数据
+3. **更新笔记**：在笔记文件中补充压测数据
+4. **总结**：完成 Week 4 周总结
+> 先根据 DESIGN.md 自己写，遇到困难再看参考。

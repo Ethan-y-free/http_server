@@ -10,8 +10,6 @@
 #include <unordered_map>
 #include <memory>
 #include <thread>
-#include <chrono>
-#include <format>
 
 struct Connection
 {
@@ -71,6 +69,7 @@ private:
         std::string ip;
         int port = 0;
         Socket client = listen_sock_.Accept(ip, port);
+        if (client.Fd() < 0) return;
         client.SetNonBlocking();
         int client_fd = client.Fd();
 
@@ -128,14 +127,13 @@ private:
         size_t len = conn.inputBuffer.ReadableBytes();
         conn.inputBuffer.RetrieveAll();
 
-        pool_->Run([this, fd, len]()
+        pool_->Run([this, fd]()
+        {
+            loop_->RunInLoop([this, fd]
             {
-                std::cout << std::format("  [Worker {}] 处理 {} 字节", std::this_thread::get_id(), len) << std::endl;
-                loop_->RunInLoop([this, fd]
-                    {
-                        FlushWrite(fd);
-                    });
+                FlushWrite(fd);
             });
+        });
     }
 
     void OnWrite(int fd)

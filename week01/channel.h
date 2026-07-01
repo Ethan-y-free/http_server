@@ -43,9 +43,9 @@ public:
     //   如果 fd_ >= 0，手动从 epoll 摘掉
     ~Channel()
     {
-        if (fd_ >= 0 && epoll_)
+        if (fd_ >= 0 && epoll_ && events_ != 0)
         {
-            epoll_->Del(fd_);
+            DisableAll();  // events_ != 0 说明还没摘除，先摘再析构
         }
     }
 

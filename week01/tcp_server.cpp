@@ -112,7 +112,7 @@ int main()
 
             // accept() 阻塞直到有新连接
             Socket client_sock = listen_sock.Accept(client_ip, client_port);
-
+            if (client_sock.Fd() < 0) continue;
             // 处理当前客户端（内部 recv/send 也是阻塞的）
             handle_client(client_sock, client_ip, client_port);
 
