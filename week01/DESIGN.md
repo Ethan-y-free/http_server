@@ -2645,7 +2645,7 @@ done
 | Day 11 | 单 Reactor Echo Server | ✅ |
 | Day 12 | 主从 Reactor Echo Server | ✅ |
 | Day 13 | HTTP 请求解析（状态机） | ✅ |
-| Day 14 | 压测对比 + 周总结 | ⬜ |
+| Day 14 | 压测对比 + 周总结 | ✅ |
 
 ### Week 4 新增文件
 
@@ -2693,3 +2693,436 @@ week01/
 3. **更新笔记**：在笔记文件中补充压测数据
 4. **总结**：完成 Week 4 周总结
 > 先根据 DESIGN.md 自己写，遇到困难再看参考。
+
+---
+
+# Day 15 技术文档：HTTP 静态文件服务
+
+---
+
+## 十六、我们要做什么
+
+当前 `GenerateResponse()` 是硬编码的 HTML 字符串——无论请求什么路径都返回 "Hello from http_server!"。Day 15 把它升级为真正的**静态文件服务器**：
+
+```
+现在（硬编码）                           Day 15（静态文件）
+──────────────────────────             ──────────────────────────
+GET /          → "Hello..."             GET /          → www/index.html
+GET /foo       → "Hello... Path: /foo"  GET /style.css → www/style.css
+GET /nonexist  → "Hello..."             GET /nonexist  → 404 Not Found
+```
+
+**目标**：浏览器访问 `http://localhost:8888/` 能看到真正的 HTML 页面，支持 CSS/JS/图片。
+
+---
+
+## 十六.1 模块架构
+
+新增一个 `HttpStaticHandler` 类，放在 `http_static_handler.h` 中：
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  HttpStaticHandler                    │
+│                                                      │
+│  职责：URL → 文件系统路径 → 读文件 → HTTP 响应        │
+│                                                      │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐ │
+│  │  MapPath()  │  │  ReadFile()  │  │ GetMimeType()│ │
+│  │ 路径映射    │  │  读文件内容   │  │  MIME 检测   │ │
+│  │ + 安全检查  │  │              │  │              │ │
+│  └─────────────┘  └──────────────┘  └─────────────┘ │
+│                                                      │
+│  HandleRequest(req, output) — 唯一对外入口            │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## 十六.2 HttpStaticHandler API
+
+### 文件：`http_static_handler.h`（你需要从头写）
+
+### 职责
+URL 路径 → 文件系统路径 → 读取文件 → 生成 HTTP 响应。对外只有一个入口 `HandleRequest()`。
+
+### API 清单
+
+#### 对外方法（public）
+
+| 方法 | 参数 | 返回值 | 说明 |
+|------|------|--------|------|
+| `HttpStaticHandler(root_dir)` | `const std::string&` | — | 构造函数，初始化 `root_dir_` + `index_file_`，去掉 root_dir 末尾 `/` |
+| `SetIndexFile(index)` | `const std::string&` | `void` | 设置目录默认文件，默认值 `"index.html"` |
+| `HandleRequest(req, output)` | `const HttpRequest&`, `Buffer*` | `void` | **唯一对外入口**：按 `HandleRequest` 流程生成 HTTP 响应 |
+
+#### 私有方法（private）— 按参考代码顺序
+
+| 方法 | 参数 | 返回值 | 说明 |
+|------|------|--------|------|
+| `UrlDecode(str)` | `const std::string&` | `std::string` | URL 解码；%20→空格，%2F→/；大小写不敏感 |
+| `MapPath(url_path)` | `const std::string&` | `std::string` | URL 路径 → 文件系统路径；含 `..` 安全拦截，返回空串=拒绝 |
+| `GetMimeType(path)` | `const std::string&` | `std::string` | 扩展名 → MIME 类型；未知返回 `application/octet-stream` |
+| `ReadFile(path, content)` | `const std::string&`, `std::string&` | `bool` | 二进制模式读整个文件；成功 true，失败 false |
+| `BuildResponse(...)` | 8 个参数（见签名） | `void` | 拼接完整 HTTP 响应头+体写入 Buffer |
+| `IsHex(c)` | `char` | `bool` | 判断字符是否为十六进制数字（0-9/A-F/a-f） |
+| `HexToInt(c)` | `char` | `int` | 十六进制字符 → 整数值（'A'→10, 'F'→15） |
+| `IsDirectory(path)` | `const std::string&` | `bool` | `stat()` 判断路径是否为目录 |
+| `FileExists(path)` | `const std::string&` | `bool` | `stat()` 判断路径是否为普通文件且存在 |
+| `EscapeHtml(str)` | `const std::string&` | `std::string` | HTML 实体转义（`<`→`&lt;` 等），防 XSS |
+
+#### 静态成员变量
+
+| 变量 | 类型 | 说明 |
+|------|------|------|
+| `kEmptyBody_` | `const std::string` | HEAD 请求用于替代 body 的空串 |
+
+### API 签名
+
+```cpp
+class HttpStaticHandler
+{
+public:
+    // 构造：root_dir 可为相对路径（"./www"）或绝对路径
+    // 内部处理：去掉末尾 '/'、初始化 index_file_ 为 "index.html"
+    explicit HttpStaticHandler(const std::string& root_dir);
+
+    // 设置目录默认文件
+    void SetIndexFile(const std::string& index);
+
+    // ====== 唯一对外入口 ======
+    void HandleRequest(const HttpRequest& req, Buffer* output);
+
+private:
+    // ---- URL 处理 ----
+    // %20 → 空格，%2F → /，+ → 空格，大小写不敏感
+    static std::string UrlDecode(const std::string& str);
+
+    // URL 路径 → 文件系统路径
+    // 返回空串表示拒绝访问（检测到 ".."）
+    // 前置条件：调用方必须先 UrlDecode
+    std::string MapPath(const std::string& url_path);
+
+    // ---- MIME 类型 ----
+    // 提取扩展名 → 查表 → 返回 MIME 字符串
+    static std::string GetMimeType(const std::string& path);
+
+    // ---- 文件读取 ----
+    // 二进制模式（std::ios::binary | std::ios::ate），成功返回 true
+    static bool ReadFile(const std::string& path, std::string& content);
+
+    // ---- 响应生成 ----
+    // 拼接 HTTP 响应头 + body，写入 Buffer
+    // head_only=true 时 Content-Length 保留但 body 不发送
+    static void BuildResponse(int status_code,
+                              const std::string& status_msg,
+                              const std::string& body,
+                              const std::string& mime_type,
+                              bool keep_alive,
+                              const std::string& version,
+                              bool head_only,
+                              Buffer* output);
+
+    // ---- 工具函数 ----
+    static bool IsHex(char c);
+    static int  HexToInt(char c);
+    static bool IsDirectory(const std::string& path);
+    static bool FileExists(const std::string& path);
+    static std::string EscapeHtml(const std::string& str);
+
+    // ---- 成员变量 ----
+    std::string root_dir_;
+    std::string index_file_;
+
+    // ---- 静态成员 ----
+    static const std::string kEmptyBody_;
+};
+```
+
+---
+
+## 十六.3 HandleRequest 核心流程
+
+```
+HandleRequest(req, output)
+    │
+    ├─ 1. method 不是 GET/HEAD？
+    │      └─ → 405 Method Not Allowed
+    │
+    ├─ 2. url_path = UrlDecode(req.GetPath())
+    │
+    ├─ 3. file_path = MapPath(url_path)
+    │      └─ 为空（含 ..）？ → 403 Forbidden
+    │
+    ├─ 4. 路径是目录？
+    │      └─ 拼上 index_file_ 再试
+    │
+    ├─ 5. ReadFile(file_path, content)
+    │      ├─ 成功 → BuildResponse(200, content)
+    │      └─ 失败 → BuildResponse(404)
+    │
+    └─ 6. HEAD 请求：body 置空，只返回头
+```
+
+---
+
+## 十六.4 MapPath + 安全设计
+
+**核心原则**：绝不把用户输入的路径直接拼到文件系统路径上。
+
+```cpp
+std::string MapPath(const std::string& url_path)
+{
+    // ① 解码 %xx（%20→空格，%2F→/）
+    std::string decoded = UrlDecode(url_path);
+
+    // ② 安全检查：禁止 ".." 目录穿越
+    if (decoded.find("..") != std::string::npos)
+    {
+        return "";  // 空串 = 拒绝访问
+    }
+
+    // ③ 拼接到 root_dir_（root_dir_ 已是绝对路径）
+    std::string result = root_dir_ + "/" + decoded;
+
+    // ④ 规范化路径（去掉连续的 //）
+    // 提示：用 while 循环替换 "//" → "/"
+
+    return result;
+}
+```
+
+### 攻击场景演示
+
+```
+正常请求：  GET /index.html        → ./www/index.html       ✅
+攻击请求：  GET /../etc/passwd      → MapPath 返回 ""        → 403
+攻击请求：  GET /..%2F..%2Fetc      → UrlDecode → /../../etc → MapPath 返回 "" → 403
+```
+
+> **关键**：先 `UrlDecode` 再检查 `..`，否则编码绕过。
+
+---
+
+## 十六.5 UrlDecode 规范
+
+| 编码 | 解码 |
+|------|------|
+| `%20` | 空格 |
+| `%2F` | `/` |
+| `%2f` | `/`（大小写不敏感） |
+| `%25` | `%` |
+| `+` | 空格（query string 约定，path 里少见） |
+
+### 算法
+
+```
+遍历字符串：
+  遇到 '%' 且后面有两个 hex 字符 →
+    转换为对应 ASCII 字符
+  否则 → 原样保留
+```
+
+> 解码后的字符串可能比输入短（`%20` 3 字节→空格 1 字节）。
+
+---
+
+## 十六.6 MIME 类型映射表
+
+`GetMimeType(path)` 提取文件扩展名，查表返回对应 MIME 类型：
+
+| 扩展名 | MIME 类型 |
+|--------|----------|
+| `.html`, `.htm` | `text/html` |
+| `.css` | `text/css` |
+| `.js` | `application/javascript` |
+| `.json` | `application/json` |
+| `.png` | `image/png` |
+| `.jpg`, `.jpeg` | `image/jpeg` |
+| `.gif` | `image/gif` |
+| `.svg` | `image/svg+xml` |
+| `.ico` | `image/x-icon` |
+| `.txt` | `text/plain; charset=utf-8` |
+| `.xml` | `application/xml` |
+| `.pdf` | `application/pdf` |
+| `.woff` | `font/woff` |
+| `.woff2` | `font/woff2` |
+| *默认* | `application/octet-stream` |
+
+### 实现提示
+
+```cpp
+static std::string GetMimeType(const std::string& path)
+{
+    // ① 找到最后一个 '.'
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return "application/octet-stream";
+
+    // ② 取扩展名（转小写）
+    std::string ext = path.substr(dot);
+    for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+
+    // ③ 查表（if-else 或 static unordered_map）
+    static const std::unordered_map<std::string, std::string> mime = {
+        {".html", "text/html; charset=utf-8"},
+        {".css",  "text/css; charset=utf-8"},
+        // ... 补全
+    };
+
+    auto it = mime.find(ext);
+    return it != mime.end() ? it->second : "application/octet-stream";
+}
+```
+
+---
+
+## 十六.7 HTTP 响应格式
+
+`BuildResponse` 拼接如下格式的字符串：
+
+```http
+HTTP/1.1 200 OK\r\n
+Server: tiny-http/1.0\r\n
+Content-Type: text/html; charset=utf-8\r\n
+Content-Length: 1234\r\n
+Connection: keep-alive\r\n
+\r\n
+<html>...</html>
+```
+
+### 各状态码的响应
+
+| 状态码 | Status Message | 是否有 Body |
+|--------|---------------|-------------|
+| 200 | OK | ✅ 文件内容 |
+| 403 | Forbidden | ✅ 简单 HTML 错误页 |
+| 404 | Not Found | ✅ 简单 HTML 错误页 |
+| 405 | Method Not Allowed | ✅ 简单 HTML 错误页 |
+| 500 | Internal Server Error | ✅ 简单 HTML 错误页 |
+
+### HEAD 请求处理
+
+```cpp
+if (req.GetMethod() == "HEAD")
+{
+    // 响应头完全一样，只是不发送 body
+    // 提示：Content-Length 仍然写实际文件大小，但 body 部分留空
+}
+```
+
+---
+
+## 十六.8 ReadFile 实现提示
+
+```cpp
+bool ReadFile(const std::string& path, std::string& content)
+{
+    // ① 以二进制模式打开（图片等）
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return false;
+
+    // ② 用 ate 模式获取文件大小
+    auto size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    // ③ 预分配 + 一次性读入
+    content.resize(static_cast<size_t>(size));
+    file.read(&content[0], size);
+    // 或：content.assign((std::istreambuf_iterator<char>(file)),
+    //                     std::istreambuf_iterator<char>());
+
+    return file.good();
+}
+```
+
+> **注意**：二进制模式！文本模式在 Windows 上会把 `\r\n` 转成 `\n`，损坏图片/JS 文件。
+
+---
+
+## 十六.9 与现有代码集成
+
+修改 `multi_reactor_http.cpp` 中的 `GenerateResponse`：
+
+```cpp
+// 原来：
+static void GenerateResponse(const HttpRequest& req, Buffer* output)
+{
+    // 硬编码 HTML...
+}
+
+// 改为：
+#include "http_static_handler.h"
+
+static HttpStaticHandler g_handler("./www");  // 全局或传入
+
+static void GenerateResponse(const HttpRequest& req, Buffer* output)
+{
+    g_handler.HandleRequest(req, output);
+}
+```
+
+---
+
+## 十六.10 测试静态文件目录
+
+在项目目录下创建 `www/` 文件夹：
+
+```
+week01/
+├── www/                     ← 新建
+│   ├── index.html           ← 首页
+│   ├── style.css            ← 样式
+│   ├── 404.html             ← 自定义 404 页（可选）
+│   └── images/              ← 图片目录（可选）
+│       └── logo.png
+├── http_static_handler.h    ← 你要写的
+├── multi_reactor_http.cpp   ← 修改 GenerateResponse
+└── ...
+```
+
+### 测试方法
+
+```bash
+# ① 编译
+cd build && cmake .. && make multi_reactor_http
+
+# ② 启动
+./week01/multi_reactor_http &
+
+# ③ 浏览器测试
+curl -v http://localhost:8888/                    # 200 + HTML
+curl -v http://localhost:8888/style.css           # 200 + CSS
+curl -v http://localhost:8888/nonexist.html       # 404
+curl -v --path-as-is http://localhost:8888/../etc/passwd  # 403
+
+# ④ 浏览器
+# 在 Linux VM 中启动后，宿主机浏览器访问 http://<VM_IP>:8888/
+```
+
+---
+
+## 十六.11 Day 15 任务清单
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 1 | **写 `http_static_handler.h`** | 包含完整的 HttpStaticHandler 类 |
+| 2 | **创建 `www/` 目录 + 测试文件** | 至少有 index.html 和 style.css |
+| 3 | **修改 `multi_reactor_http.cpp`** | 替换 GenerateResponse 为 HttpStaticHandler |
+| 4 | **编译 + 测试** | curl 验证 200/404/403，浏览器验证页面渲染 |
+| 5 | **更新笔记** | 记录实现要点和安全设计 |
+
+> 先根据 DESIGN.md 自己写，遇到困难再看 `reference/http_static_handler_full.h`。
+
+---
+
+## 十六.12 实现检查清单
+
+完成 Day 15 后自查：
+
+- [ ] `MapPath` 正确拦截 `..` 路径穿越
+- [ ] `UrlDecode` 在 `..` 检查之前调用
+- [ ] `ReadFile` 使用二进制模式打开文件
+- [ ] `GetMimeType` 至少覆盖 .html/.css/.js/.png/.jpg 五种
+- [ ] HEAD 请求返回正确 Content-Length 但不含 body
+- [ ] 目录请求能自动 fallback 到 index 文件
+- [ ] 错误页（404/403/500）有简单的 HTML body
+- [ ] curl 测试全部通过

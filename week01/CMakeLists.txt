@@ -55,7 +55,7 @@ add_executable(multi_reactor_server multi_reactor_server.cpp ${HEADERS})
 # ==========================================================
 # 目标 8：主从 Reactor HTTP Server（集成 HTTP 解析）
 # ==========================================================
-add_executable(multi_reactor_http multi_reactor_http.cpp ${HEADERS} http_request.h http_parser.h)
+add_executable(multi_reactor_http multi_reactor_http.cpp ${HEADERS} http_request.h http_parser.h http_static_handler.h)
 
 # ==========================================================
 # 目标 9：主从 Reactor HTTP Server（优化参考版 — 无锁架构）

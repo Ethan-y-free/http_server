@@ -5,6 +5,7 @@
 #include "eventloop.h"
 #include "threadpool.h"
 #include "http_parser.h"
+#include "http_static_handler.h"
 
 #include <iostream>
 #include <string>
@@ -27,65 +28,10 @@ struct Connection
 	int subIndex;  // 所属 SubReactor
 };
 
+static HttpStaticHandler g_handler("/home/ethany/.vs/http_server/8043fcde-127c-492a-a0b0-72c8fb565f69/src/week01/www");
 static void GenerateResponse(const HttpRequest& req, Buffer* output)
 {
-	std::string body;
-	std::string status;
-
-	if (req.GetMethod() == "GET" || req.GetMethod() == "HEAD")
-	{
-		status = "200 OK";
-		body = "<html><body><h1>Hello from http_server!</h1>"
-			"<p>Path: " + req.GetPath() + "</p>"
-			"<p>Method: " + req.GetMethod() + "</p>"
-			"</body></html>";
-	}
-	else if (req.GetMethod() == "POST")
-	{
-		status = "200 OK";
-		body = "<html><body><h1>POST received</h1>"
-			"<p>Body: " + req.GetBody() + "</p>"
-			"</body></html>";
-	}
-	else
-	{
-		status = "405 Method Not Allowed";
-		body = "<html><body><h1>405 Method Not Allowed</h1></body></html>";
-	}
-
-	char buf[4096];
-	int len;
-
-	if (req.GetMethod() == "HEAD")
-	{
-		len = snprintf(buf, sizeof(buf),
-			"%s %s\r\n"
-			"Server: tiny-http/1.0\r\n"
-			"Content-Type: text/html; charset=utf-8\r\n"
-			"Content-Length: %zu\r\n"
-			"Connection: %s\r\n"
-			"\r\n",
-			req.GetVersion().c_str(), status.c_str(),
-			body.size(),
-			req.IsKeepAlive() ? "keep-alive" : "close");
-	}
-	else
-	{
-		len = snprintf(buf, sizeof(buf),
-			"%s %s\r\n"
-			"Server: tiny-http/1.0\r\n"
-			"Content-Type: text/html; charset=utf-8\r\n"
-			"Content-Length: %zu\r\n"
-			"Connection: %s\r\n"
-			"\r\n"
-			"%s",
-			req.GetVersion().c_str(), status.c_str(),
-			body.size(),
-			req.IsKeepAlive() ? "keep-alive" : "close",
-			body.c_str());
-	}
-
-	output->Append(buf, static_cast<size_t>(len));
+	g_handler.HandleRequest(req, output);
 }
 
 class MultiReactorServer

@@ -1,0 +1,120 @@
+/* ===========================================
+   tiny-http Server — 测试用样式表
+   =========================================== */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+    color: #e0e0e0;
+    min-height: 100vh;
+    padding: 2rem;
+}
+
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+header {
+    text-align: center;
+    padding: 3rem 0 2rem;
+}
+
+header h1 {
+    font-size: 3rem;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(90deg, #f093fb, #f5576c, #fda085);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+.subtitle {
+    font-size: 1.1rem;
+    color: #888;
+}
+
+/* ---- 卡片 ---- */
+
+.card {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 1.5rem;
+    backdrop-filter: blur(10px);
+}
+
+.card h2 {
+    font-size: 1.3rem;
+    margin-bottom: 1rem;
+    color: #fda085;
+}
+
+.card ul {
+    list-style: none;
+    padding-left: 0;
+}
+
+.card li {
+    padding: 0.4rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.card li:last-child {
+    border-bottom: none;
+}
+
+.card li::before {
+    content: "▸ ";
+    color: #f5576c;
+}
+
+.card a {
+    color: #f093fb;
+    text-decoration: none;
+}
+
+.card a:hover {
+    text-decoration: underline;
+}
+
+/* ---- 表格 ---- */
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+}
+
+th, td {
+    padding: 0.6rem 1rem;
+    text-align: left;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+th {
+    color: #fda085;
+    font-weight: 600;
+}
+
+.note {
+    margin-top: 0.8rem;
+    font-size: 0.85rem;
+    color: #666;
+}
+
+/* ---- 页脚 ---- */
+
+footer {
+    text-align: center;
+    padding: 2rem;
+    color: #555;
+    font-size: 0.9rem;
+}
