@@ -3102,13 +3102,13 @@ curl -v --path-as-is http://localhost:8888/../etc/passwd  # 403
 
 ## 十六.11 Day 15 任务清单
 
-| # | 任务 | 说明 |
-|---|------|------|
-| 1 | **写 `http_static_handler.h`** | 包含完整的 HttpStaticHandler 类 |
-| 2 | **创建 `www/` 目录 + 测试文件** | 至少有 index.html 和 style.css |
-| 3 | **修改 `multi_reactor_http.cpp`** | 替换 GenerateResponse 为 HttpStaticHandler |
-| 4 | **编译 + 测试** | curl 验证 200/404/403，浏览器验证页面渲染 |
-| 5 | **更新笔记** | 记录实现要点和安全设计 |
+| # | 任务 | 说明 | 状态 |
+|---|------|------|:---:|
+| 1 | **写 `http_static_handler.h`** | 包含完整的 HttpStaticHandler 类 | ✅ |
+| 2 | **创建 `www/` 目录 + 测试文件** | 至少有 index.html 和 style.css | ✅ |
+| 3 | **修改 `multi_reactor_http.cpp`** | 替换 GenerateResponse 为 HttpStaticHandler | ✅ |
+| 4 | **编译 + 测试** | curl 验证 200/404/403，浏览器验证页面渲染 | ✅ |
+| 5 | **更新笔记** | 记录实现要点和安全设计 | ✅ |
 
 > 先根据 DESIGN.md 自己写，遇到困难再看 `reference/http_static_handler_full.h`。
 
@@ -3118,11 +3118,163 @@ curl -v --path-as-is http://localhost:8888/../etc/passwd  # 403
 
 完成 Day 15 后自查：
 
-- [ ] `MapPath` 正确拦截 `..` 路径穿越
-- [ ] `UrlDecode` 在 `..` 检查之前调用
-- [ ] `ReadFile` 使用二进制模式打开文件
-- [ ] `GetMimeType` 至少覆盖 .html/.css/.js/.png/.jpg 五种
-- [ ] HEAD 请求返回正确 Content-Length 但不含 body
-- [ ] 目录请求能自动 fallback 到 index 文件
-- [ ] 错误页（404/403/500）有简单的 HTML body
-- [ ] curl 测试全部通过
+- [x] `MapPath` 正确拦截 `..` 路径穿越
+- [x] `UrlDecode` 在 `..` 检查之前调用
+- [x] `ReadFile` 使用二进制模式打开文件
+- [x] `GetMimeType` 至少覆盖 .html/.css/.js/.png/.jpg 五种
+- [x] HEAD 请求返回正确 Content-Length 但不含 body
+- [x] 目录请求能自动 fallback 到 index 文件
+- [x] 错误页（404/403/500）有简单的 HTML body
+- [x] curl 测试全部通过
+
+---
+
+# Day 16 技术文档：HTTP/1.1 长连接（Keep-Alive 流水线）
+
+---
+
+## 十七、问题在哪
+
+当前代码已经能识别 `Connection: keep-alive`，响应头也写了对应字段，`conn.parser.Reset()` 后连接也不关。但有个隐蔽 bug：
+
+```
+客户端一次发了两个请求（pipelining）：
+  GET / HTTP/1.1\r\n...\r\n\r\nGET /style.css HTTP/1.1\r\n...\r\n\r\n
+  └─────── 请求 1 ──────────┘└──────── 请求 2 ────────────┘
+
+服务器处理：
+  ① ReadFd → 两个请求一起读进 inputBuffer
+  ② Parse → 消耗请求 1 的数据（Retrieve）
+  ③ GenerateResponse → 写入 outputBuffer
+  ④ parser.Reset()   ← 请求 2 的数据还在 buffer 里！
+  ⑤ FlushWrite → 写完响应
+  ⑥ return           ← 请求 2 被晾在 buffer 里，没人管了
+```
+
+下次 `epoll_wait` 不会再通知这个 fd（因为内核缓冲区已经读空了），请求 2 永远得不到响应——直到客户端超时断开。
+
+## 十七.1 怎么修
+
+`OnRead` 里的解析步骤加一个 `while` 循环：只要 buffer 里还有可读数据，就继续解析。
+
+```
+改前:  ReadFd → Parse一次 → Generate → FlushWrite → return
+改后:  ReadFd → while (buffer有数据):
+                   Parse → need_more? break（等下次数据）
+                         → done?   Generate + Reset + 继续循环
+                         → error?  关连接
+                → FlushWrite
+```
+
+## 十七.2 改动范围
+
+只改 **一个文件**：`multi_reactor_http.cpp` 的 `OnRead` 方法。
+
+`Connection` 结构体加一个计数器：
+
+```cpp
+struct Connection
+{
+    // ... 原有字段 ...
+    int requestCount = 0;  // ← 新增：keep-alive 已处理请求数
+};
+```
+
+常量：
+
+```cpp
+constexpr int MAX_KEEPALIVE_REQUESTS = 100;  // 单连接最多处理 100 个请求
+```
+
+## 十七.3 OnRead 改动伪代码
+
+```cpp
+void OnRead(int fd, EventLoop* sub, int idx)
+{
+    // ====== 第一部分不变：读数据 ======
+    ReadFd → 失败/EOF? → 关连接
+           → EAGAIN?   → return
+
+    // ====== 第二部分：循环解析（这是新加的 while）======
+    bool shouldClose = false;
+    while (conn.inputBuffer.ReadableBytes() > 0)
+    {
+        auto result = conn.parser.Parse(&conn.inputBuffer);
+
+        if (result == PARSE_NEED_MORE)
+        {
+            break;  // 数据不完整，等下次
+        }
+
+        if (result == PARSE_ERROR)
+        {
+            shouldClose = true;
+            break;
+        }
+
+        if (result == PARSE_OK && conn.parser.IsDone())
+        {
+            const HttpRequest& req = conn.parser.GetRequest();
+            GenerateResponse(req, &conn.outputBuffer);
+            conn.requestCount++;
+
+            if (!req.IsKeepAlive() || conn.requestCount >= MAX_KEEPALIVE_REQUESTS)
+            {
+                shouldClose = true;
+                break;
+            }
+
+            conn.parser.Reset();
+            // ← 回到 while 顶部，检查 buffer 里是否还有数据
+        }
+    }
+
+    if (shouldClose)
+    {
+        OnClose(fd, sub, idx);
+        return;
+    }
+
+    FlushWrite(fd, idx);
+}
+```
+
+## 十七.4 关键点
+
+| 要点 | 说明 |
+|------|------|
+| `while` 条件 | `ReadableBytes() > 0`，buffer 有数据就继续 |
+| `PARSE_NEED_MORE` | `break` 退出循环，等下次 `epoll_wait` |
+| `PARSE_OK + IsDone` | 生成响应后用 `continue` 语义回到循环顶部 |
+| `PARSE_ERROR` | `break` + 关连接 |
+| `requestCount` | 达到上限就关，防止一个连接占用过久 |
+| `FlushWrite` | 放在循环外面，所有响应拼完一次性写 |
+
+## 十七.5 测试
+
+```bash
+# ① 编译运行
+cmake --build . --target multi_reactor_http
+./week01/multi_reactor_http &
+
+# ② 单请求 keep-alive（curl 默认 HTTP/1.1 + keep-alive）
+curl -v http://localhost:8888/
+
+# ③ pipelining：一次发两个请求
+echo -e "GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /style.css HTTP/1.1\r\nHost: localhost\r\n\r\n" | nc localhost 8888
+
+# ④ ab keep-alive 压测
+ab -k -n 10000 -c 10 http://127.0.0.1:8888/
+```
+
+## 十七.6 Day 16 任务清单
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 1 | `Connection` 加 `requestCount` | 计数器 |
+| 2 | 加 `MAX_KEEPALIVE_REQUESTS` 常量 | 100 |
+| 3 | `OnRead` 加 `while` 循环 | 核心改动 |
+| 4 | 编译 + curl/nc pipelining 测试 | 验证两个请求一次发送 |
+| 5 | `ab -k` 压测对比 | 记录 keep-alive vs 短连接 QPS |
+
+> 先根据 DESIGN.md 自己改，遇到困难再看参考。

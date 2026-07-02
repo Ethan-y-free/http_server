@@ -26,7 +26,9 @@ struct Connection
 	EventLoop* ownerLoop;
 	HttpRequestParser parser;
 	int subIndex;  // 所属 SubReactor
+	int requestCount = 0;
 };
+constexpr int MAX_KEEPALIVE_REQUESTS = 10000;
 
 static HttpStaticHandler g_handler("/home/ethany/.vs/http_server/8043fcde-127c-492a-a0b0-72c8fb565f69/src/week01/www");
 static void GenerateResponse(const HttpRequest& req, Buffer* output)
@@ -181,38 +183,42 @@ private:
 		}
 		else
 		{
-			auto result = conn.parser.Parse(&conn.inputBuffer);
-
-			if (result == HttpRequestParser::PARSE_ERROR)
+			while (conn.inputBuffer.ReadableBytes() > 0)
 			{
-				std::cerr << "[ERROR] HTTP 解析失败 fd=" << fd << std::endl;
-				shouldClose = true;
-			}
-			else if (result == HttpRequestParser::PARSE_OK && conn.parser.IsDone())
-			{
-				const HttpRequest& req = conn.parser.GetRequest();
-				GenerateResponse(req, &conn.outputBuffer);
+				auto result = conn.parser.Parse(&conn.inputBuffer);
 
-				if (!req.IsKeepAlive())
+				if (result == HttpRequestParser::PARSE_NEED_MORE)
 				{
+					break;
+				}
+				else if (result == HttpRequestParser::PARSE_ERROR)
+				{
+					std::cerr << "[ERROR] HTTP 解析失败 fd=" << fd << std::endl;
 					shouldClose = true;
+					break;
 				}
 				else
 				{
-					conn.parser.Reset();
+					const HttpRequest& req = conn.parser.GetRequest();
+					GenerateResponse(req, &conn.outputBuffer);
+					conn.requestCount++;
+
+					if (!req.IsKeepAlive() || conn.requestCount >= MAX_KEEPALIVE_REQUESTS)
+					{
+						shouldClose = true;
+						break;
+					}
+					else conn.parser.Reset();
 				}
 			}
 		}
+        FlushWrite(fd, idx);
 
-		if (shouldClose)
+		if (shouldClose && conn.outputBuffer.ReadableBytes() == 0)
 		{
 			OnClose(fd, sub, idx);
 			return;
 		}
-
-		// 移除多余的 ThreadPool 任务投递开销，改为当前从 SubReactor 直接写回
-		// 此处因为业务逻辑极为轻量，直接在本线程完成发送能够极大提高性能
-		FlushWrite(fd, idx);
 	}
 
 	void OnWrite(int fd, EventLoop* sub, int idx)
