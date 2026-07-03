@@ -3278,3 +3278,283 @@ ab -k -n 10000 -c 10 http://127.0.0.1:8888/
 | 5 | `ab -k` 压测对比 | 记录 keep-alive vs 短连接 QPS |
 
 > 先根据 DESIGN.md 自己改，遇到困难再看参考。
+
+---
+
+## 十八、时间轮定时器（Day 17 — 7/3）
+
+### 十八.1 问题在哪
+
+当前 Keep-Alive 实现有个漏洞：客户端连上来后不发请求，连接就永远挂着。这叫**慢速攻击（Slowloris）**——恶意客户端只建连接不发数据，耗尽服务器 fd。
+
+需要一个定时器机制：**连接 60 秒没 IO 活动就踢掉**。
+
+### 十八.2 什么是时间轮
+
+时间轮就是一个环形数组，每个槽代表一个时间片。指针每秒走一格，转到哪个槽就把里面的连接全踢掉。
+
+```
+      ┌───┬───┬───┬───┬───┐
+      │ 0 │ 1 │ 2 │...│59 │  ← 60 个槽，每个 1 秒
+      └───┴─▲─┴───┴───┴───┘
+            │
+       指针每秒走一格 → 刚好 60 秒一圈
+```
+
+- 新连接插入：算目标槽 → 放入 → O(1)
+- 连接活跃刷新：旧槽移除 → 新槽插入 → O(1)  
+- 连接关闭移除：查到所在槽 → 删除 → O(1)
+- Tick：返回当前槽所有 fd → 清空 → 指针前进 → O(槽内 fd 数)
+
+### 十八.3 集成架构：外部组件方案
+
+不改 EventLoop。每个 SubReactor 独立挂一个 TimerWheel + timerfd：
+
+```
+SubReactor-0 线程:
+  ├── EventLoop
+  ├── subClients_[0]          ← 连接表（已有）
+  ├── timerfd_0               ← 内核定时器（新增）
+  ├── Channel(timerfd_0)      ← 把 timerfd 压入 epoll（新增）
+  ├── TimerWheel              ← 时间轮数据结构（新增）
+  └── 回调: timerfd 可读 → Tick() → 踢到期连接
+```
+
+为什么每个 SubReactor 一个：
+- subClients_ 已经按 SubReactor 分片，时间轮管自己的连接
+- 全部在同一个线程里，无锁
+
+### 十八.4 TimerWheel API
+
+```cpp
+class TimerWheel
+{
+public:
+    // 构造：槽数 + 每 tick 毫秒数
+    // 例如 TimerWheel(60, 1000) = 60 槽 × 1 秒 = 60 秒超时
+    TimerWheel(int slotCount, int tickMs);
+
+    // 添加或刷新连接：fd 从现在起 timeoutMs 毫秒后到期
+    void AddOrRefresh(int fd, int timeoutMs);
+
+    // 移除连接（连接关闭时调用）
+    void Remove(int fd);
+
+    // 推动时间轮，返回本轮到期的 fd 列表
+    // 调用方遍历列表，逐个关闭连接
+    std::vector<int> Tick();
+
+    // 当前时间轮中的连接数
+    int Size() const;
+};
+```
+
+**数据结构**：
+```cpp
+private:
+    int slotCount_;                              // 槽总数
+    int tickMs_;                                 // 每 tick 毫秒
+    int currentSlot_;                            // 指针位置 (0 ~ slotCount_-1)
+    std::vector<std::unordered_set<int>> slots_; // 每个槽存 fd 集合
+    std::unordered_map<int, int> fdToSlot_;      // fd → 所在槽号（O(1) 删除用）
+```
+
+### 十八.5 AddOrRefresh 算法
+
+```
+AddOrRefresh(fd, timeoutMs):
+    ① 如果 fd 已存在 → 从旧槽删除（通过 fdToSlot_ 找到旧槽）
+    ② 计算目标槽：targetSlot = (currentSlot_ + timeoutMs / tickMs_) % slotCount_
+    ③ slots_[targetSlot].insert(fd)
+    ④ fdToSlot_[fd] = targetSlot
+```
+
+### 十八.6 Tick 算法
+
+```
+Tick():
+    ① expired = {}  // 空列表
+    ② 如果 slots_[currentSlot_] 非空：
+        expired = 拷贝当前槽的所有 fd
+        对每个 fd：fdToSlot_.erase(fd)
+        清空 slots_[currentSlot_]
+    ③ currentSlot_ = (currentSlot_ + 1) % slotCount_
+    ④ return expired
+```
+
+### 十八.7 timerfd 是什么
+
+Linux 内核提供的一个"定时器 fd"。创建后像普通 fd 一样使用：
+
+```cpp
+#include <sys/timerfd.h>
+
+// ① 创建
+int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+
+// ② 设置周期
+struct itimerspec ts;
+ts.it_value.tv_sec  = 1;   // 首次触发：1 秒后
+ts.it_value.tv_nsec = 0;
+ts.it_interval.tv_sec = 1; // 之后：每 1 秒触发
+ts.it_interval.tv_nsec = 0;
+timerfd_settime(tfd, 0, &ts, nullptr);
+
+// ③ 加入 epoll（和 socket 一样）
+// Channel 的 readCallback 里：
+uint64_t expirations;
+::read(tfd, &expirations, sizeof(expirations));
+// read() 返回本次到期的次数（正常为 1，如果处理慢了可能 > 1）
+
+timer_wheel_.Tick();  // 推动时间轮
+```
+
+### 十八.8 集成改动范围
+
+**只需改 `multi_reactor_http.cpp`**，不改任何已有头文件。
+
+#### 8.1 新增头文件
+
+```cpp
+#include <sys/timerfd.h>
+#include "timer_wheel.h"
+```
+
+#### 8.2 MultiReactorServer 新增成员
+
+```cpp
+constexpr int TIMEOUT_SECONDS = 60;  // 空闲超时
+
+std::vector<int>                   timerFds_;       // 每个 SubReactor 一个 timerfd
+std::vector<std::unique_ptr<Channel>> timerChannels_; // timerfd 的 Channel
+std::vector<TimerWheel>            timerWheels_;     // 每个 SubReactor 一个时间轮
+```
+
+#### 8.3 构造函数改动
+
+在创建 SubReactor 线程的循环中，分配好 `timerFds_`/`timerChannels_`/`timerWheels_` 空间后，对每个 SubReactor：
+
+```cpp
+// 在 subLoops_[i]->RunInLoop(...) 中执行：
+
+// ① 创建 timerfd
+int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+
+// ② 设置每 1 秒触发
+struct itimerspec ts;
+ts.it_value.tv_sec  = TIMEOUT_TICK_SEC;
+ts.it_value.tv_nsec = 0;
+ts.it_interval.tv_sec = TIMEOUT_TICK_SEC;
+ts.it_interval.tv_nsec = 0;
+timerfd_settime(tfd, 0, &ts, nullptr);
+
+// ③ 创建 Channel 并设置 readCallback
+auto ch = std::make_unique<Channel>(tfd, sub->EpollPtr());
+ch->SetReadCallback([this, idx]() {
+    uint64_t expirations;
+    ::read(timerFds_[idx], &expirations, sizeof(expirations));
+
+    // 如果事件循环忙，可能错过了几次 tick，补转
+    for (uint64_t i = 0; i < expirations; ++i)
+    {
+        auto expired = timerWheels_[idx].Tick();
+        for (int fd : expired)
+        {
+            OnClose(fd, subLoops_[idx].get(), idx);
+        }
+    }
+});
+
+// ④ 注册到 EventLoop
+sub->AddChannel(ch.get());
+ch->EnableRead();
+```
+
+#### 8.4 OnAccept 改动
+
+新连接接入后，注册到时间轮：
+
+```cpp
+// OnAccept 中，subClients_[idx].emplace 之后：
+timerWheels_[idx].AddOrRefresh(client_fd, TIMEOUT_SECONDS * 1000);
+```
+
+#### 8.5 OnRead 改动
+
+收到数据并成功处理后，刷新超时：
+
+```cpp
+// OnRead 中，GenerateResponse(...) 之后：
+timerWheels_[idx].AddOrRefresh(fd, TIMEOUT_SECONDS * 1000);
+```
+
+#### 8.6 OnClose 改动
+
+关闭连接时从时间轮移除：
+
+```cpp
+// OnClose 中，RemoveClientChannel 之前：
+timerWheels_[idx].Remove(fd);
+```
+
+#### 8.7 析构函数改动
+
+清理 timerfd 相关资源（在 join 子线程之前）：
+
+```cpp
+// 在 subLoops_[i]->Quit() 之前或之后，
+// RunInLoop 中 RemoveChannel + close timerfd
+for (int i = 0; i < subReactorCount; ++i)
+{
+    if (timerChannels_[i])
+    {
+        subLoops_[i]->RunInLoop([this, i]() {
+            // timerChannels_[i].reset() 会触发 ~Channel，
+            // ~Channel 已经会 DisableAll → epoll_->Del(fd_)
+            timerChannels_[i].reset();
+        });
+    }
+}
+// 子线程 join 后 close timerfd
+for (int i = 0; i < subReactorCount; ++i)
+{
+    if (timerFds_[i] >= 0)
+        ::close(timerFds_[i]);
+}
+```
+
+### 十八.9 测试
+
+```bash
+# ① 编译
+cmake --build . --target multi_reactor_http
+
+# ② 启动服务器
+./week01/multi_reactor_http &
+
+# ③ 测试：建立连接但不发数据，60 秒后连接被踢
+nc localhost 8888
+# （什么都不输入，等 60 秒，连接自动断开）
+
+# ④ 测试：活跃连接不被踢
+curl http://localhost:8888/
+# 等 10 秒再 curl http://localhost:8888/
+# 等 10 秒再 curl http://localhost:8888/
+# ... 连接应该一直保持（每次请求刷新了定时器）
+
+# ⑤ 验证时间轮本身
+# 可以用 telnet 建多个连接，看 TimerWheel::Size() 输出
+```
+
+### 十八.10 Day 17 任务清单
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 1 | 创建 `timer_wheel.h` | 根据 §十八.4~6 自己实现 |
+| 2 | 在 `multi_reactor_http.cpp` 中集成 | 根据 §十八.8 改动 |
+| 3 | 编译通过 | `cmake --build . --target multi_reactor_http` |
+| 4 | nc 不发送数据测试 | 60 秒后连接自动断开 |
+| 5 | curl 多次请求测试 | 活跃连接不被踢 |
+| 6 | 对照 `reference/timer_wheel_full.h` | 看自己实现和参考的差异 |
+
+> 先根据 DESIGN.md 自己写 `timer_wheel.h` 和改 `multi_reactor_http.cpp`，遇到困难再看 reference/。

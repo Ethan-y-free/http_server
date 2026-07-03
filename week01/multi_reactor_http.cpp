@@ -6,13 +6,16 @@
 #include "threadpool.h"
 #include "http_parser.h"
 #include "http_static_handler.h"
+#include "timer_wheel.h"
 
 #include <iostream>
+#include <unistd.h>
 #include <string>
 #include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <sys/timerfd.h>
 #include <atomic>
 #include <vector>
 #include <cstring>
@@ -29,6 +32,8 @@ struct Connection
 	int requestCount = 0;
 };
 constexpr int MAX_KEEPALIVE_REQUESTS = 10000;
+constexpr int TIMEOUT_SECONDS = 60;   // 空闲超时秒数
+constexpr int TIMEOUT_TICK_SEC = 1;    // timerfd 每秒触发一次
 
 static HttpStaticHandler g_handler("/home/ethany/.vs/http_server/8043fcde-127c-492a-a0b0-72c8fb565f69/src/week01/www");
 static void GenerateResponse(const HttpRequest& req, Buffer* output)
@@ -44,6 +49,9 @@ public:
 	{
 		subLoops_.resize(subReactorCount);
 		subClients_.resize(subReactorCount);
+		timerFds_.resize(subReactorCount, -1);
+		timerChannels_.resize(subReactorCount);
+		timerWheels_.resize(subReactorCount);
 
 		for (int i = 0; i < subReactorCount; ++i)
 		{
@@ -51,8 +59,41 @@ public:
 
 			subThreads_.emplace_back([this, i]()
 			{
-				subLoops_[i]->Loop();
+				subLoops_[i]->Loop(); // 接受内核，用户态的操作，有回调
 			});
+
+			timerWheels_[i] = std::make_unique<TimerWheel>(60, 1000);
+			subLoops_[i]->RunInLoop([this, i]() // 内部程序初始化或内部操作调用
+				{
+					int time_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+					timerFds_[i] = time_fd;
+					struct itimerspec ts;
+					ts.it_value.tv_sec = TIMEOUT_TICK_SEC;
+					ts.it_value.tv_nsec = 0;
+					ts.it_interval.tv_sec = TIMEOUT_TICK_SEC;
+					ts.it_interval.tv_nsec = 0;
+					timerfd_settime(time_fd, 0, &ts, nullptr);
+
+				// 创建 Channel + 设置 readCallback（Tick → OnClose）
+					auto ch = std::make_unique<Channel>(time_fd, subLoops_[i]->EpollPtr());
+					ch->SetReadCallback([this, i]()
+						{
+							uint64_t expirations;
+							::read(timerFds_[i], &expirations, sizeof(expirations));
+
+							for (uint64_t j = 0; j < expirations; ++j)
+							{
+								auto expired = timerWheels_[i]->Tick();
+								for (int fd : expired)
+								{
+									OnClose(fd, subLoops_[i].get(), i);
+								}
+							}
+						});
+					subLoops_[i]->AddChannel(ch.get());
+					ch->EnableRead();
+					timerChannels_[i] = std::move(ch);
+				});
 		}
 
 		listen_sock_.SetReuseAddr();
@@ -80,16 +121,36 @@ public:
 			mainLoop_->RemoveChannel(listen_channel_.get());
 		}
 
+		for (int i = 0; i < subLoops_.size(); ++i)
+		{
+			if (timerChannels_[i])
+			{
+				subLoops_[i]->RunInLoop([this, i]()
+					{
+						// timerChannels_[i].reset() 会触发 ~Channel，
+						// ~Channel 已经会 DisableAll → epoll_->Del(fd_)
+						timerChannels_[i].reset();
+					});
+			}
+		}
+
 		for (auto& subLoop : subLoops_)
 		{
 			subLoop->Quit();
 		}
+
 		for (auto& t : subThreads_)
 		{
 			if (t.joinable())
 			{
 				t.join();
 			}
+		}
+
+		for (int i = 0; i < subLoops_.size(); ++i)
+		{
+			if (timerFds_[i] >= 0)
+				::close(timerFds_[i]);
 		}
 
 		subClients_.clear();
@@ -145,6 +206,7 @@ private:
 
 			// 直接写入对应 SubReactor 的表（完全由该子线程操作，绝对线程安全）
 			auto [it, inserted] = subClients_[idx].emplace(client_fd, std::move(conn));
+			timerWheels_[idx]->AddOrRefresh(client_fd, TIMEOUT_SECONDS * 1000);
 			if (inserted)
 			{
 				it->second.ownerLoop->AddChannel(it->second.channel.get());
@@ -201,6 +263,7 @@ private:
 				{
 					const HttpRequest& req = conn.parser.GetRequest();
 					GenerateResponse(req, &conn.outputBuffer);
+					timerWheels_[idx]->AddOrRefresh(fd, TIMEOUT_SECONDS * 1000);
 					conn.requestCount++;
 
 					if (!req.IsKeepAlive() || conn.requestCount >= MAX_KEEPALIVE_REQUESTS)
@@ -230,6 +293,7 @@ private:
 	void OnClose(int fd, EventLoop* sub, int idx)
 	{
 		(void)sub;
+		timerWheels_[idx]->Remove(fd);
 		RemoveClientChannel(fd, idx);
 		subClients_[idx].erase(fd);
 	}
@@ -301,6 +365,10 @@ private:
 
 	std::vector<std::unordered_map<int, Connection>> subClients_;
 	std::atomic<int> nextSubReactor_{ 0 };
+
+	std::vector<int> timerFds_;
+	std::vector<std::unique_ptr<Channel>> timerChannels_;
+	std::vector<std::unique_ptr<TimerWheel>> timerWheels_;
 };
 
 
