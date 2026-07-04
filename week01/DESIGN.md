@@ -3558,3 +3558,258 @@ curl http://localhost:8888/
 | 6 | 对照 `reference/timer_wheel_full.h` | 看自己实现和参考的差异 |
 
 > 先根据 DESIGN.md 自己写 `timer_wheel.h` 和改 `multi_reactor_http.cpp`，遇到困难再看 reference/。
+
+---
+
+## 十九、Day 18：异步日志系统
+
+### 十九.1 当前问题
+
+`multi_reactor_http.cpp` 里的日志现状：
+
+```cpp
+// 启动信息 — stdout
+std::cout << "\n======= 主从 Reactor HTTP Server" << std::endl;
+
+// 错误信息 — stderr
+std::cerr << "[ERROR] ReadFd fd=" << fd << ": " << std::strerror(savedErrno) << std::endl;
+std::cerr << "[ERROR] HTTP 解析失败 fd=" << fd << std::endl;
+```
+
+每次 `operator<<` 都可能触发 `write()` 系统调用，SubReactor 线程频繁进出内核态。没有时间戳和调用位置，排错信息不全。
+
+### 十九.2 设计目标
+
+- SubReactor 纯内存操作打日志，不碰磁盘
+- 双缓冲 + 后台线程异步写盘
+- 日志自动带时间戳（微秒）+ 级别 + 文件名:行号
+
+### 十九.3 文件组织
+
+```
+async_logger/
+    log_stream.h         格式化缓冲区 4KB, operator<<
+    log_buffer.h         双缓冲, Append(), 和后台线程交接
+    async_log_writer.h   后台线程, Submit(lambda), 唯一写盘
+    logger.h             对外统一入口: Logger + LogLevel + 宏
+```
+
+使用者只需 `#include "logger.h"`。
+
+### 十九.4 log_stream.h — LogStream
+
+4KB 固定缓冲区，`operator<<` 重载串行拼接日志内容。
+
+```cpp
+class LogStream
+{
+public:
+    LogStream();
+
+    // operator<< 重载
+    LogStream& operator<<(bool v);
+    LogStream& operator<<(short v);
+    LogStream& operator<<(unsigned short v);
+    LogStream& operator<<(int v);
+    LogStream& operator<<(unsigned int v);
+    LogStream& operator<<(long v);
+    LogStream& operator<<(unsigned long v);
+    LogStream& operator<<(long long v);
+    LogStream& operator<<(unsigned long long v);
+    LogStream& operator<<(float v);
+    LogStream& operator<<(double v);
+    LogStream& operator<<(char v);
+    LogStream& operator<<(const char* str);
+    LogStream& operator<<(const std::string& str);
+    LogStream& operator<<(const void* ptr);
+
+    void Reset();
+    const char* Data() const;
+    size_t Size() const;
+
+private:
+    char  buffer_[4096];
+    char* cur_;
+    size_t Avail() const;
+    void Append(const char* data, size_t len);
+    void FormatInteger(unsigned long long v);
+    void FormatInteger(long long v);
+};
+```
+
+### 十九.5 log_buffer.h — LogBuffer
+
+每个 SubReactor 一个实例，单线程使用，无锁。
+
+```cpp
+class AsyncLogWriter;  // 前向声明
+
+class LogBuffer
+{
+public:
+    // writer: 后台写盘线程引用
+    explicit LogBuffer(AsyncLogWriter* writer);
+
+    // 追加日志数据，纯内存操作
+    void Append(const char* data, size_t len);
+
+private:
+    static constexpr size_t kBufferSize = 4 * 1024 * 1024;  // 4MB
+
+    std::vector<char> current_;
+    std::vector<char> next_;
+    AsyncLogWriter* writer_;  // 满 buffer 投递目标
+};
+```
+
+工作流程：
+
+```
+Append(data, len):
+  if current_.size() + len <= kBufferSize:
+      current_.insert(data, len)              // 够放，直接写
+  else:
+      swap(current_, next_)                   // 满 buffer 轮转
+      满 buffer → writer_->Submit(lambda)      // 打包扔给后台线程
+      current_.clear()
+      current_.insert(data, len)
+```
+
+### 十九.6 async_log_writer.h — AsyncLogWriter
+
+全局唯一实例，后台线程收满 buffer 顺序写盘。
+
+```cpp
+class AsyncLogWriter
+{
+public:
+    explicit AsyncLogWriter(const std::string& filepath);
+
+    void Start();
+    void Stop();
+
+    // LogBuffer 调用，提交满 buffer 的写盘任务
+    void Submit(std::function<void()> task);
+
+private:
+    void ThreadFunc();
+
+    std::string filepath_;
+    std::atomic<bool> running_;
+
+    std::mutex mutex_;
+    std::condition_variable cond_;
+    std::vector<std::function<void()>> tasks_;
+    std::thread thread_;
+};
+```
+
+ThreadFunc：
+
+```
+loop:
+    wait(tasks_ 非空 或 超时 3 秒)
+    lock → 交换 tasks_ → unlock
+    遍历执行每个 task（每个 task = fwrite(buf) + clear(buf)）
+    fflush()
+```
+
+### 十九.7 logger.h — Logger + 宏（对外入口）
+
+```cpp
+#include "log_stream.h"
+#include "log_buffer.h"
+#include "async_log_writer.h"
+
+enum class LogLevel { TRACE, DEBUG, INFO, WARN, ERROR, FATAL };
+
+class Logger
+{
+public:
+    Logger(const char* file, int line, LogLevel level);
+    ~Logger();  // 追加 \n → LogBuffer::Append()
+
+    LogStream& Stream();
+
+private:
+    LogStream stream_;
+    const char* file_;
+    int line_;
+    LogLevel level_;
+};
+
+// 全局访问点
+extern AsyncLogWriter* g_logWriter;           // 唯一后台线程
+extern std::vector<LogBuffer*> g_logBuffers;  // 每个 SubReactor 一个
+
+// 根据当前线程 ID 找到对应的 LogBuffer（thread_local）
+LogBuffer* CurrentLogBuffer();
+
+// 宏
+#define LOG_TRACE Logger(__FILE__, __LINE__, LogLevel::TRACE).Stream()
+#define LOG_DEBUG Logger(__FILE__, __LINE__, LogLevel::DEBUG).Stream()
+#define LOG_INFO  Logger(__FILE__, __LINE__, LogLevel::INFO).Stream()
+#define LOG_WARN  Logger(__FILE__, __LINE__, LogLevel::WARN).Stream()
+#define LOG_ERROR Logger(__FILE__, __LINE__, LogLevel::ERROR).Stream()
+#define LOG_FATAL Logger(__FILE__, __LINE__, LogLevel::FATAL).Stream()
+```
+
+使用效果：
+
+```cpp
+LOG_ERROR << "ReadFd fd=" << fd << ": " << std::strerror(savedErrno);
+// → [2026-07-04 14:30:12.123456] [ERROR] multi_reactor_http.cpp:239 ReadFd fd=42: Bad file descriptor
+```
+
+### 十九.8 如何找到"当前线程的 LogBuffer"
+
+`Logger::~Logger()` 需要知道该往哪个 LogBuffer 投递。每个 SubReactor 线程启动时设置 `thread_local` 指针：
+
+```cpp
+// logger.h 中
+inline thread_local LogBuffer* t_currentLogBuffer = nullptr;
+
+inline LogBuffer* CurrentLogBuffer()
+{
+    return t_currentLogBuffer;
+}
+```
+
+```cpp
+// multi_reactor_http.cpp SubReactor 线程启动时：
+subThreads_.emplace_back([this, i]()
+{
+    t_currentLogBuffer = logBuffers_[i].get();  // 绑定
+    subLoops_[i]->Loop();
+});
+```
+
+### 十九.9 集成到 multi_reactor_http.cpp
+
+**新增成员**：
+
+```cpp
+std::vector<std::unique_ptr<LogBuffer>> logBuffers_;
+AsyncLogWriter logWriter_{"server.log"};
+```
+
+**替换示例**：
+
+```cpp
+// 旧
+std::cerr << "[ERROR] ReadFd fd=" << fd << std::endl;
+// 新
+LOG_ERROR << "ReadFd fd=" << fd << ": " << std::strerror(savedErrno);
+```
+
+### 十九.10 Day 18 任务清单
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 1 | 创建 `log_stream.h` | 4KB 格式化缓冲区 + operator<< |
+| 2 | 创建 `log_buffer.h` | 双缓冲 + Append() |
+| 3 | 创建 `async_log_writer.h` | 后台线程 + Submit() + 写盘 |
+| 4 | 创建 `logger.h` | Logger + LogLevel + 宏 + thread_local |
+| 5 | 集成到 `multi_reactor_http.cpp` | 替换 std::cerr/cout |
+| 6 | CMakeLists.txt 无需改动 | 全是 header-only |
+| 7 | 编译测试 | 启动 tail -f server.log 验证 |

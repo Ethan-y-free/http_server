@@ -7,7 +7,6 @@
 #include "http_parser.h"
 #include "http_static_handler.h"
 #include "timer_wheel.h"
-#include "async_logger/logger.h"
 
 #include <iostream>
 #include <unistd.h>
@@ -20,10 +19,6 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
-
-// 全局日志访问点（logger.h 中 extern 声明，此处定义）
-AsyncLogWriter* g_logWriter = nullptr;
-std::vector<LogBuffer*> g_logBuffers;
 
 struct Connection
 {
@@ -40,7 +35,7 @@ constexpr int MAX_KEEPALIVE_REQUESTS = 10000;
 constexpr int TIMEOUT_SECONDS = 60;   // 空闲超时秒数
 constexpr int TIMEOUT_TICK_SEC = 1;    // timerfd 每秒触发一次
 
-static HttpStaticHandler g_handler("/home/ethany/.vs/http_server/8043fcde-127c-492a-a0b0-72c8fb565f69/src/week01/www");
+static HttpStaticHandler g_handler("www");
 static void GenerateResponse(const HttpRequest& req, Buffer* output)
 {
 	g_handler.HandleRequest(req, output);
@@ -57,28 +52,18 @@ public:
 		timerFds_.resize(subReactorCount, -1);
 		timerChannels_.resize(subReactorCount);
 		timerWheels_.resize(subReactorCount);
-		logBuffers_.resize(subReactorCount);
-
-		// ★ 先绑端口再启线程，避免 bind 失败时 joinable 线程被析构
-		listen_sock_.SetReuseAddr();
-		listen_sock_.Bind(port);
-		listen_sock_.Listen(128);
-		listen_sock_.SetNonBlocking();
 
 		for (int i = 0; i < subReactorCount; ++i)
 		{
 			subLoops_[i] = std::make_unique<EventLoop>();
 
-			logBuffers_[i] = std::make_unique<LogBuffer>(g_logWriter);
-
 			subThreads_.emplace_back([this, i]()
 			{
-				Logger::SetCurrentLogBuffer(logBuffers_[i].get());
-				subLoops_[i]->Loop();
+				subLoops_[i]->Loop(); // 接受内核，用户态的操作，有回调
 			});
 
 			timerWheels_[i] = std::make_unique<TimerWheel>(60, 1000);
-			subLoops_[i]->RunInLoop([this, i]()
+			subLoops_[i]->RunInLoop([this, i]() // 内部程序初始化或内部操作调用
 				{
 					int time_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 					timerFds_[i] = time_fd;
@@ -89,6 +74,7 @@ public:
 					ts.it_interval.tv_nsec = 0;
 					timerfd_settime(time_fd, 0, &ts, nullptr);
 
+				// 创建 Channel + 设置 readCallback（Tick → OnClose）
 					auto ch = std::make_unique<Channel>(time_fd, subLoops_[i]->EpollPtr());
 					ch->SetReadCallback([this, i]()
 						{
@@ -103,18 +89,17 @@ public:
 									OnClose(fd, subLoops_[i].get(), i);
 								}
 							}
-
-							// 每秒刷一次日志到后台线程
-							if (logBuffers_[i])
-							{
-								logBuffers_[i]->Flush();
-							}
 						});
 					subLoops_[i]->AddChannel(ch.get());
 					ch->EnableRead();
 					timerChannels_[i] = std::move(ch);
 				});
 		}
+
+		listen_sock_.SetReuseAddr();
+		listen_sock_.Bind(port);
+		listen_sock_.Listen(128);
+		listen_sock_.SetNonBlocking();
 
 		std::cout << "\n========================================" << std::endl;
 		std::cout << "  主从 Reactor HTTP Server" << std::endl;
@@ -142,6 +127,8 @@ public:
 			{
 				subLoops_[i]->RunInLoop([this, i]()
 					{
+						// timerChannels_[i].reset() 会触发 ~Channel，
+						// ~Channel 已经会 DisableAll → epoll_->Del(fd_)
 						timerChannels_[i].reset();
 					});
 			}
@@ -189,12 +176,11 @@ private:
 		int idx = nextSubReactor_.fetch_add(1) % static_cast<int>(subLoops_.size());
 		EventLoop* subLoop = subLoops_[idx].get();
 
+		// 将 client_sock 转移至 shared_ptr 保证可被跨线程移动与持有
 		auto sock_ptr = std::make_shared<Socket>(std::move(client_sock));
 
-		subLoop->RunInLoop([this, client_fd, sock_ptr, subLoop, idx, ip, port]()
+		subLoop->RunInLoop([this, client_fd, sock_ptr, subLoop, idx]()
 		{
-			LOG_INFO << "新连接 " << ip << ":" << port << " → SubReactor " << idx;
-
 			Connection conn;
 			conn.sock = std::move(*sock_ptr);
 			conn.channel = std::make_unique<Channel>(client_fd, subLoop->EpollPtr());
@@ -218,6 +204,7 @@ private:
 				OnError(fd, sub, idx);
 			});
 
+			// 直接写入对应 SubReactor 的表（完全由该子线程操作，绝对线程安全）
 			auto [it, inserted] = subClients_[idx].emplace(client_fd, std::move(conn));
 			timerWheels_[idx]->AddOrRefresh(client_fd, TIMEOUT_SECONDS * 1000);
 			if (inserted)
@@ -249,7 +236,7 @@ private:
 			{
 				return;
 			}
-			LOG_ERROR << "ReadFd fd=" << fd << ": " << std::strerror(savedErrno);
+			std::cerr << "[ERROR] ReadFd fd=" << fd << ": " << std::strerror(savedErrno) << std::endl;
 			shouldClose = true;
 		}
 		else if (n == 0)
@@ -268,7 +255,7 @@ private:
 				}
 				else if (result == HttpRequestParser::PARSE_ERROR)
 				{
-					LOG_ERROR << "HTTP 解析失败 fd=" << fd;
+					std::cerr << "[ERROR] HTTP 解析失败 fd=" << fd << std::endl;
 					shouldClose = true;
 					break;
 				}
@@ -288,7 +275,7 @@ private:
 				}
 			}
 		}
-		FlushWrite(fd, idx);
+        FlushWrite(fd, idx);
 
 		if (shouldClose && conn.outputBuffer.ReadableBytes() == 0)
 		{
@@ -306,7 +293,6 @@ private:
 	void OnClose(int fd, EventLoop* sub, int idx)
 	{
 		(void)sub;
-		LOG_INFO << "连接关闭 fd=" << fd;
 		timerWheels_[idx]->Remove(fd);
 		RemoveClientChannel(fd, idx);
 		subClients_[idx].erase(fd);
@@ -314,7 +300,6 @@ private:
 
 	void OnError(int fd, EventLoop* sub, int idx)
 	{
-		LOG_ERROR << "连接错误 fd=" << fd;
 		OnClose(fd, sub, idx);
 	}
 
@@ -384,8 +369,6 @@ private:
 	std::vector<int> timerFds_;
 	std::vector<std::unique_ptr<Channel>> timerChannels_;
 	std::vector<std::unique_ptr<TimerWheel>> timerWheels_;
-
-	std::vector<std::unique_ptr<LogBuffer>> logBuffers_;
 };
 
 
@@ -400,22 +383,16 @@ int main()
 		EventLoop mainLoop;
 		ThreadPool pool(THREADPOOL_SIZE);
 
-		AsyncLogWriter logWriter("server.log");
-		g_logWriter = &logWriter;
-		logWriter.Start();
-
 		MultiReactorServer server(&mainLoop, PORT, SUB_REACTOR_COUNT, &pool);
 
-		LOG_INFO << "MainReactor 进入 EventLoop...";
+		std::cout << "[启动] MainReactor 进入 EventLoop..." << std::endl;
 		mainLoop.Loop();
 
-		LOG_INFO << "MainReactor 正常结束";
-
-		logWriter.Stop();
+		std::cout << "[退出] MainReactor 正常结束" << std::endl;
 	}
 	catch (const std::exception& e)
 	{
-		LOG_FATAL << e.what();
+		std::cerr << "[FATAL] " << e.what() << std::endl;
 		return 1;
 	}
 
