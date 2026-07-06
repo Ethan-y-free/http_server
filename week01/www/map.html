@@ -1,0 +1,712 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>江西财经大学 · 麦庐园校区导航</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <!-- 加载过渡层（星光汇聚 → 光波散开） -->
+    <div id="loader">
+        <div class="ld-stars"></div>
+        <div class="ld-center-ring"></div>
+        <span class="ld-text">正在加载地图</span>
+    </div>
+
+    <div id="container"></div>
+
+    <!-- 浮动展开按钮 -->
+    <button id="expand-btn" title="展开面板">☰</button>
+
+    <!-- 侧边面板 -->
+    <div id="panel">
+        <div class="panel-header">
+            <h2>🗺️ 江财 · 麦庐园导航</h2>
+            <div class="subtitle">江西财经大学麦庐园校区</div>
+        </div>
+
+        <label>起点</label>
+        <div class="input-group">
+            <span class="dot start"></span>
+            <input id="start-input" type="text" placeholder="输入或选择起点…" autocomplete="off">
+            <div class="suggest-list" id="start-suggest"></div>
+        </div>
+
+        <label>终点</label>
+        <div class="input-group">
+            <span class="dot end"></span>
+            <input id="end-input" type="text" placeholder="输入或选择终点…" autocomplete="off">
+            <div class="suggest-list" id="end-suggest"></div>
+        </div>
+
+        <div class="btn-group">
+            <button class="btn btn-swap" id="swap-btn" title="交换起点和终点">⇄</button>
+            <button class="btn btn-primary" id="nav-btn">🚀 开始导航</button>
+        </div>
+
+        <!-- 路线选择 tabs -->
+        <div id="route-tabs"></div>
+
+        <!-- 路线详情 -->
+        <div id="route-info">
+            <div class="stat"><span>总距离</span><span class="val" id="dist-val">--</span></div>
+            <div class="stat"><span>预计步行</span><span class="val" id="time-val">--</span></div>
+            <ol id="steps-list"></ol>
+            <button class="clear-btn" id="clear-btn">清除路线</button>
+        </div>
+
+        <hr>
+        <div id="status">✅ 就绪，选择起点和终点开始导航</div>
+    </div>
+
+    <!-- ===== 底部状态栏 ===== -->
+    <div id="bottom-bar">
+        <div class="bb-route-picker" id="bb-tabs"></div>
+        <div class="bb-info">
+            <span class="bb-dist" id="bb-dist">--</span>
+            <span class="bb-divider">|</span>
+            <span class="bb-time" id="bb-time">--</span>
+            <span class="bb-divider">|</span>
+            <span class="bb-steps" id="bb-steps">--</span>
+        </div>
+    </div>
+
+    <!-- ===== 建筑详情卡片 ===== -->
+    <div id="detail-card">
+        <button id="detail-close" title="关闭">✕</button>
+        <div class="dc-header">
+            <span class="dc-tag" id="dc-tag"></span>
+            <h3 id="dc-name"></h3>
+        </div>
+        <p class="dc-desc" id="dc-desc"></p>
+        <div class="dc-photos" id="dc-photos">
+            <!-- 照片占位：用户填充后显示 <img>，无照片时显示占位文字 -->
+        </div>
+        <div class="dc-nav">
+            <button class="dc-nav-btn" id="dc-nav-start">📍 设为起点</button>
+            <button class="dc-nav-btn" id="dc-nav-end">📍 设为终点</button>
+        </div>
+    </div>
+
+    <!-- 高德地图 -->
+    <script>
+        window._AMapSecurityConfig = { securityJsCode: "be893ec371eceacf34bfcbba3ff1e922" };
+    </script>
+    <script src="https://webapi.amap.com/maps?v=2.0&key=8eb24da9084fb43e35fffae70fd6d4d9&plugin=AMap.ControlBar,AMap.ToolBar"></script>
+
+    <script>
+    /* ===========================================================
+       校园建筑数据库
+       =========================================================== */
+    const CAMPUS_POIS = [
+        // ---- 校门 ----
+        { name: '南门',   lng: 115.816643, lat: 28.724558, cat: '校门',
+          desc: '麦庐园校区南大门，正对至善广场和图书馆中轴线，是校区主入口。', photos: ['/photos/south_gate.jpg'] },
+        { name: '北门',   lng: 115.816710, lat: 28.730830, cat: '校门',
+          desc: '麦庐园校区北门，靠近北区学生公寓和第三食堂。', photos: ['/photos/north_gate1.png', '/photos/north_gate2.png'] },
+
+        // ---- 图书馆 ----
+        { name: '图书馆（图文信息楼）', lng: 115.816600, lat: 28.728070, cat: '图书馆',
+          desc: '校区中轴线上的标志性建筑。一楼机房，二至五楼图书馆，六至九楼办公区。正对至善广场，是自习首选地。', photos: ['/photos/library.png'] },
+
+        // ---- 教学楼 ----
+        { name: '第一教学楼', lng: 115.815800, lat: 28.725700, cat: '教学楼',
+          desc: '位于南区至善广场左前方，主要承担公共基础课教学。', photos: ['/photos/teaching1.jpg'] },
+        { name: '第二教学楼', lng: 115.818000, lat: 28.725750, cat: '教学楼',
+          desc: '位于南区至善广场右前方，配有多媒体教室和智慧课堂系统。', photos: [] },
+        { name: '第三教学楼', lng: 115.818200, lat: 28.732950, cat: '教学楼',
+          desc: '位于北区学生宿舍后方，方便北区学生就近上课。', photos: ['/photos/teaching3.jpg'] },
+
+        // ---- 学院楼 ----
+        { name: '荟庐（软件与物联网工程学院）', lng: 115.813650, lat: 28.725650, cat: '学院',
+          desc: '荟庐，软件与物联网工程学院所在地。培养计算机与物联网方向的工程技术人才，位于校区西南侧。', photos: ['/photos/huilu.jpg'] },
+        { name: '信息管理学院',         lng: 115.813550, lat: 28.725750, cat: '学院',
+          desc: '聚焦信息管理与信息系统方向，与软件学院相邻。', photos: [] },
+        { name: '统计学院',             lng: 115.815800, lat: 28.728800, cat: '学院',
+          desc: '培养数据分析与统计应用方向的复合型人才。', photos: [] },
+        { name: '工商管理学院',         lng: 115.817500, lat: 28.733820, cat: '学院',
+          desc: '工商管理学院（MBA 中心），位于校区北侧，靠近北区宿舍。', photos: ['/photos/business_school.jpg'] },
+        { name: '艺术学院',             lng: 115.814600, lat: 28.726800, cat: '学院',
+          desc: '设计与艺术学院，设有绘画、设计、音乐等专业教室。', photos: [] },
+        { name: '群庐（法学院）',   lng: 115.819000, lat: 28.726500, cat: '学院',
+          desc: '群庐，法学院所在地。位于英庐北侧约100米。', photos: ['/photos/qunlu.jpg'] },
+        { name: '英庐（外国语学院）',   lng: 115.819000, lat: 28.725600, cat: '学院',
+          desc: '英庐，外国语学院所在地。与荟庐一东一西，分踞校区南侧两角。', photos: ['/photos/yinglu.jpg'] },
+        { name: '萃庐',   lng: 115.814000, lat: 28.726800, cat: '学院',
+          desc: '学院教学楼，设有艺术展厅和创新工作室。', photos: [] },
+
+        // ---- 宿舍（南区） ----
+        { name: '宁庐',   lng: 115.814400, lat: 28.729300, cat: '宿舍',
+          desc: '南区学生公寓，紧邻一食堂。标准四人间，上床下桌，独立卫浴，空调全覆盖。', photos: ['/photos/ninglu1.jpg', '/photos/ninglu2.jpg'] },
+        { name: '静庐',   lng: 115.815100, lat: 28.730600, cat: '宿舍',
+          desc: '南区蓝色建筑群学生公寓，与宁庐相邻，以"宁静祥和"命名。', photos: ['/photos/jinglu.jpg'] },
+        { name: '祥庐',   lng: 115.817500, lat: 28.730400, cat: '宿舍',
+          desc: '南区学生公寓，紧邻二食堂东侧，生活便利。', photos: [] },
+        { name: '和庐',   lng: 115.817200, lat: 28.729060, cat: '宿舍',
+          desc: '南区学生公寓，靠近商业街和运动场，有独特连廊设计。', photos: ['/photos/helu.png'] },
+
+        // ---- 餐饮 ----
+        { name: '一食堂',   lng: 115.815200, lat: 28.730000, cat: '服务',
+          desc: '南区商业街西侧尽头，主打经济实惠家常菜，"中乐春天"入驻。', photos: ['/photos/canteen1.jpg'] },
+        { name: '二食堂',   lng: 115.817400, lat: 28.729800, cat: '服务',
+          desc: '南区商业街东侧尽头，现代感设计，通透玻璃与大堂，风味窗口林立。', photos: [] },
+        { name: '三食堂',   lng: 115.818500, lat: 28.732500, cat: '服务',
+          desc: '北区学生宿舍后方，提供便捷家常菜品，设有民族餐厅。', photos: [] },
+
+        // ---- 体育 ----
+        { name: '体育馆',   lng: 115.817900, lat: 28.727400, cat: '体育',
+          desc: '三层综合体育馆（书型顶部），含篮球馆、游泳馆、羽毛球馆、武术馆、舞蹈室等。', photos: ['/photos/gymnasium.webp'] },
+        { name: '运动场',   lng: 115.818900, lat: 28.729150, cat: '体育',
+          desc: '标准400米塑胶田径场，含足球场和看台，周边有网球场和篮球场。', photos: [] },
+
+        // ---- 其他 ----
+        { name: '商业街',   lng: 115.817500, lat: 28.729900, cat: '服务',
+          desc: '校园商业街，连接两座食堂，汇集麦当劳、瑞幸、蜜雪冰城、古茗等品牌。', photos: ['/photos/shop_street.jpg'] },
+        { name: '大学生活动中心', lng: 115.815500, lat: 28.727600, cat: '服务',
+          desc: '学生社团活动和文艺演出的主要场地，原经济学院位置西移50米。', photos: ['/photos/student_center.png'] },
+        { name: '十二生肖广场',   lng: 115.816300, lat: 28.728600, cat: '服务',
+          desc: '校区中心地标，东侧十二生肖雕像，西侧钟楼，是校园拍照打卡热门地点。', photos: [] },
+    ];
+
+    const CAT_COLORS = {
+        '校门':'#8B4513','教学楼':'#1a6cff','图书馆':'#e67e22',
+        '宿舍':'#9b59b6','体育':'#22ac38','学院':'#2980b9','服务':'#f39c12',
+    };
+
+    // 路线颜色方案
+    const ROUTE_COLORS = [
+        { main:'#1a6cff', alt:'#a0c8ff', label:'路线一（推荐）' },
+        { main:'#22ac38', alt:'#8ed89a', label:'路线二' },
+        { main:'#e67e22', alt:'#f0c090', label:'路线三' },
+    ];
+
+    /* ===========================================================
+       全局状态
+       =========================================================== */
+    let map;
+    let allRoutes     = [];       // 所有路线数据
+    let allPolylines  = [];       // 地图上的 Polyline 对象
+    let activeIndex   = 0;        // 当前选中路线
+    let navState      = 'idle';    // idle | routes | navigating
+    let navStepIndex  = 0;
+    let collapseTimer = null;
+    let isCollapsed   = false;
+    let startLngLat   = null;
+    let endLngLat     = null;
+
+    // DOM 引用
+    let startInput, endInput, startSuggest, endSuggest;
+    let navBtn, routeInfo, stepsList, statusEl, clearBtn, routeTabsEl;
+    let distVal, timeVal;
+    let panelEl, expandBtn, bottomBar, bbTabs, bbDist, bbTime, bbSteps;
+
+    /* ===========================================================
+       地图初始化
+       =========================================================== */
+    function initMap() {
+        map = new AMap.Map('container', {
+            center: [115.816623, 28.727408],
+            zoom: 16,
+            viewMode: '3D',
+            pitch: 50,
+            rotation: -15,
+            rotateEnable: true,
+            pitchEnable: true,
+            resizeEnable: true,
+            touchZoomEnable: true,
+            mapStyle: 'amap://styles/dark',
+            zooms: [2, 20],
+        });
+
+        var controlBar = new AMap.ControlBar({
+            position: { right: '10px', top: '10px' }
+        });
+        controlBar.addTo(map);
+
+        var toolBar = new AMap.ToolBar({
+            position: { right: '40px', top: '110px' }
+        });
+        toolBar.addTo(map);
+
+        // 地图就绪后延迟触发水波炸裂动画（至少展示 2.5 秒）
+        var loadStart = Date.now();
+        var MIN_LOAD_TIME = 2500;
+        function hideLoader() {
+            var elapsed = Date.now() - loadStart;
+            var delay = Math.max(0, MIN_LOAD_TIME - elapsed);
+            setTimeout(function(){
+                var loader = document.getElementById('loader');
+                if (loader && !loader.classList.contains('closing')) {
+                    loader.classList.add('closing');
+                    setTimeout(function(){ if (loader.parentNode) loader.parentNode.removeChild(loader); }, 1000);
+                }
+            }, delay);
+        }
+        map.on('complete', hideLoader);
+        setTimeout(function(){
+            var loader = document.getElementById('loader');
+            if (loader && !loader.classList.contains('closing')) hideLoader();
+        }, 8000);
+
+        map.on('dragstart', onMapDragStart);
+        map.on('touchstart', onMapDragStart);
+        map.on('dragend',   onMapDragEnd);
+        map.on('touchend',  onMapDragEnd);
+
+        // 点击地图空白处关闭详情卡片（排除点击 marker 导致的连锁触发）
+        map.on('click', function(){
+            if (!detailLock && currentPoi) hideDetail();
+        });
+
+        addAllMarkers();
+    }
+
+    /* ---- 面板收起/展开 ---- */
+    function collapsePanel() {
+        if (isCollapsed) return;
+        isCollapsed = true;
+        panelEl.classList.add('collapsed');
+        expandBtn.classList.add('show');
+    }
+    function expandPanel() {
+        if (!isCollapsed) return;
+        isCollapsed = false;
+        panelEl.classList.remove('collapsed');
+        expandBtn.classList.remove('show');
+    }
+    function onMapDragStart() { if (collapseTimer) clearTimeout(collapseTimer); collapsePanel(); }
+    function onMapDragEnd()   { if (collapseTimer) clearTimeout(collapseTimer); collapseTimer = setTimeout(expandPanel, 1200); }
+
+    /* ===========================================================
+       建筑标记
+       =========================================================== */
+    function addAllMarkers() {
+        CAMPUS_POIS.forEach(function(poi) {
+            var color = CAT_COLORS[poi.cat] || '#666';
+            var marker = new AMap.Marker({
+                position: [poi.lng, poi.lat],
+                content: '<div class="poi-label" style="background:'+color+';cursor:pointer;">'+poi.name+'</div>',
+                offset: new AMap.Pixel(-20, -14),
+                map: map, zIndex: 10,
+            });
+            marker.on('click', function(){ showDetail(poi); });
+        });
+    }
+
+    /* ---- 建筑详情 ---- */
+    let detailCard, dcTag, dcName, dcDesc, dcPhotos, dcNavS, dcNavE, detailClose;
+    let currentPoi = null;
+
+    let detailLock = false;
+
+    function showDetail(poi) {
+        detailLock = true;
+        setTimeout(function(){ detailLock = false; }, 200);
+        currentPoi = poi;
+        var color = CAT_COLORS[poi.cat] || '#666';
+        dcTag.textContent = poi.cat;
+        dcTag.style.background = color;
+        dcName.textContent = poi.name;
+        dcDesc.textContent = poi.desc || '暂无介绍';
+
+        // 照片区（懒加载）
+        dcPhotos.innerHTML = '';
+        if (poi.photos && poi.photos.length > 0) {
+            // 先显示骨架占位
+            var placeholders = '';
+            poi.photos.forEach(function(_, i){
+                placeholders += '<div class="dc-img-wrap"><div class="dc-spinner"></div></div>';
+            });
+            dcPhotos.innerHTML = placeholders;
+
+            // 延迟加载实际图片
+            var wraps = dcPhotos.querySelectorAll('.dc-img-wrap');
+            poi.photos.forEach(function(src, i){
+                var img = document.createElement('img');
+                img.src = src; img.alt = poi.name; img.loading = 'lazy';
+                img.addEventListener('click', function(){ map.setZoomAndCenter(18, [poi.lng, poi.lat], false, 300); });
+                img.addEventListener('load', function(){
+                    wraps[i].classList.add('loaded');
+                });
+                img.addEventListener('error', function(){
+                    wraps[i].innerHTML = '<span class="dc-img-err">加载失败</span>';
+                });
+                wraps[i].appendChild(img);
+            });
+        } else {
+            dcPhotos.innerHTML = '<div class="dc-no-photo">📷 实景照片待补充<br><small>点击地图标签可查看</small></div>';
+        }
+
+        detailCard.classList.add('show');
+        collapsePanel();
+    }
+
+    function hideDetail() {
+        detailCard.classList.remove('show');
+        currentPoi = null;
+    }
+
+    /* ===========================================================
+       搜索建议
+       =========================================================== */
+    function filterPOIs(q) {
+        if (!q) return CAMPUS_POIS;
+        q = q.toLowerCase();
+        return CAMPUS_POIS.filter(function(p){ return p.name.toLowerCase().includes(q)||p.cat.includes(q); });
+    }
+    function renderSuggest(list, container, input) {
+        container.innerHTML = '';
+        if (!list.length||(list.length===1&&list[0].name===input.value)){ container.style.display='none'; return; }
+        container.style.display='block';
+        list.forEach(function(poi){
+            var d=document.createElement('div'); d.className='item';
+            d.innerHTML=poi.name+'<span class="tag" style="background:'+(CAT_COLORS[poi.cat]||'#666')+';">'+poi.cat+'</span>';
+            d.addEventListener('mousedown',function(e){ e.preventDefault(); input.value=poi.name; container.style.display='none'; });
+            container.appendChild(d);
+        });
+    }
+    function getCoords(name) {
+        for(var i=0;i<CAMPUS_POIS.length;i++) if(CAMPUS_POIS[i].name===name) return [CAMPUS_POIS[i].lng,CAMPUS_POIS[i].lat];
+        return null;
+    }
+    function setStatus(msg,isErr){ statusEl.innerHTML=isErr?'<span class="err">❌ '+msg+'</span>':'✅ '+msg; }
+
+    /* ===========================================================
+       路线绘制 & 切换
+       =========================================================== */
+    function clearRoutes() {
+        allPolylines.forEach(function(p){ map.remove(p); });
+        allPolylines = [];
+        allRoutes = [];
+        activeIndex = 0;
+    }
+
+    function selectRoute(idx) {
+        if (idx >= allRoutes.length) return;
+        activeIndex = idx;
+
+        // 更新线条粗细/透明度
+        allPolylines.forEach(function(poly, i) {
+            var c = ROUTE_COLORS[i] || ROUTE_COLORS[ROUTE_COLORS.length-1];
+            if (i === idx) {
+                poly.setOptions({ strokeColor:c.main, strokeWeight:6, strokeOpacity:0.9, zIndex:100 });
+            } else {
+                poly.setOptions({ strokeColor:c.alt, strokeWeight:3, strokeOpacity:0.45, zIndex:50 });
+            }
+        });
+
+        // 更新 panel 内 tabs
+        var tabs = routeTabsEl.querySelectorAll('.rtab');
+        tabs.forEach(function(t,i){ t.classList.toggle('active', i===idx); });
+
+        // 更新底部栏 tabs
+        var btabs = bbTabs.querySelectorAll('.bb-tab');
+        btabs.forEach(function(t,i){ t.classList.toggle('active', i===idx); });
+
+        // 更新详情 + fly
+        updateRouteDetail(allRoutes[idx]);
+        flyToSelectedRoute();   // ★ 只有点路线标签才触发 fly
+    }
+
+    function updateRouteDetail(route) {
+        var d = route.distance, t = route.time;
+        distVal.textContent = d>=1000?(d/1000).toFixed(2)+' km':d+' m';
+        timeVal.textContent = Math.ceil(t/60)+' 分钟';
+        stepsList.innerHTML = '';
+        route.steps.forEach(function(s){
+            var li=document.createElement('li'); li.textContent=s.instruction; stepsList.appendChild(li);
+        });
+        routeInfo.style.display='block';
+
+        // 底部栏
+        bbDist.textContent = d>=1000?(d/1000).toFixed(2)+'km':d+'m';
+        bbTime.textContent = '约'+Math.ceil(t/60)+'分钟';
+        bbSteps.textContent = route.steps.length+'个路口';
+    }
+
+    /* ---- 导航模式 ---- */
+    function startNavigation() {
+        navState = 'navigating';
+        navStepIndex = 0;
+        navBtn.textContent = '⏹ 结束导航';
+        navBtn.classList.add('nav-active');
+        flyToSelectedRoute();   // 第二次点击才有 fly
+        updateNavStep();
+        collapsePanel();
+    }
+
+    function stopNavigation() {
+        navState = 'routes';
+        navBtn.textContent = '🚀 开始导航';
+        navBtn.classList.remove('nav-active');
+        // 恢复底部栏路线总览
+        updateRouteDetail(allRoutes[activeIndex]);
+    }
+
+    function updateNavStep() {
+        var route = allRoutes[activeIndex];
+        if (!route) return;
+        var step = route.steps[Math.min(navStepIndex, route.steps.length - 1)];
+
+        bbDist.textContent = (navStepIndex + 1) + '/' + route.steps.length;
+        bbTime.textContent = step.instruction;
+        bbSteps.textContent = step.distance
+            ? (step.distance >= 1000 ? (step.distance/1000).toFixed(1)+'km' : step.distance+'m')
+            : '';
+
+        var items = stepsList.querySelectorAll('li');
+        items.forEach(function(li, i){
+            li.style.background = (i === navStepIndex) ? '#e8f0fe' : '';
+            li.style.fontWeight = (i === navStepIndex) ? '600' : '';
+            li.style.borderRadius = (i === navStepIndex) ? '4px' : '';
+            li.style.padding = (i === navStepIndex) ? '2px 6px' : '';
+            if (i === navStepIndex) li.scrollIntoView({ behavior:'smooth', block:'center' });
+        });
+    }
+
+    function navNextStep() {
+        var route = allRoutes[activeIndex];
+        if (!route || navStepIndex >= route.steps.length - 1) { stopNavigation(); return; }
+        navStepIndex++;
+        updateNavStep();
+        var pt = route.steps[navStepIndex].path[0];
+        map.setZoomAndCenter(18, pt, false, 300);
+    }
+
+    function navPrevStep() {
+        if (navStepIndex <= 0) return;
+        navStepIndex--;
+        updateNavStep();
+        var pt = allRoutes[activeIndex].steps[navStepIndex].path[0];
+        map.setZoomAndCenter(18, pt, false, 300);
+    }
+
+    function flyToSelectedRoute() {
+        var route = allRoutes[activeIndex];
+        if (!route) return;
+
+        // 收集所有路径点
+        var allPts = [];
+        route.steps.forEach(function(s){ s.path.forEach(function(p){ allPts.push(p); }); });
+        if (!allPts.length) return;
+
+        // 平滑飞到路线起点，zoom 自适应涵盖全路线
+        var startPt = allPts[0];
+        var endPt = allPts[allPts.length - 1];
+
+        // 重置视角到主视角
+        map.setPitch(50);
+        map.setRotation(-15);
+
+        // 阶段 1：拉升俯瞰
+        map.setZoomAndCenter(15, startPt, false, 400);
+        // 阶段 2：落到起点附近
+        setTimeout(function(){
+            map.setZoomAndCenter(18, startPt, false, 500);
+        }, 500);
+    }
+
+    /* ===========================================================
+       导航主流程
+       =========================================================== */
+    function doRoute(sl, el, startName, endName) {
+        setStatus('正在规划路线…');
+        navBtn.disabled = true;
+        navBtn.textContent = '⏳ 规划中…';
+        clearRoutes();
+
+        AMap.plugin(['AMap.Walking'], function() {
+            var walking = new AMap.Walking({ city: '南昌' });
+            // 请求多条路线
+            walking.search(sl, el, function(status, result) {
+                navBtn.disabled = false;
+                navBtn.textContent = '🚀 开始导航';
+
+                if (status !== 'complete' || !result.routes || !result.routes.length) {
+                    setStatus('路线规划失败，请检查坐标', true);
+                    return;
+                }
+
+                allRoutes = result.routes;
+                activeIndex = 0;
+
+                // 绘制所有路线
+                allRoutes.forEach(function(route, i) {
+                    var c = ROUTE_COLORS[i] || ROUTE_COLORS[ROUTE_COLORS.length-1];
+                    var path = [];
+                    route.steps.forEach(function(s){ s.path.forEach(function(p){ path.push(p); }); });
+
+                    var poly = new AMap.Polyline({
+                        path: path,
+                        strokeColor: i===0 ? c.main : c.alt,
+                        strokeWeight: i===0 ? 6 : 3,
+                        strokeOpacity: i===0 ? 0.9 : 0.45,
+                        lineJoin: 'round',
+                        map: map,
+                        zIndex: i===0 ? 100 : 50,
+                    });
+                    allPolylines.push(poly);
+                });
+
+                // 构建路线选择 tabs
+                buildRouteTabs(startName, endName);
+
+                // 显示第一条路线详情
+                updateRouteDetail(allRoutes[0]);
+
+                // 简单适配视野（不飞，等用户点路线标签再飞）
+                map.setFitView([allPolylines[0]], false, [60, 60, 250, 60], 300);
+
+                // 显示底部栏 + 按钮切换到"开始导航"
+                bottomBar.classList.add('show');
+                navState = 'routes';
+                navBtn.textContent = '🚀 开始导航';
+
+                setStatus('共 '+allRoutes.length+' 条路线，选择一条后点击「开始导航」');
+
+                // 2 秒后收起面板
+                if (collapseTimer) clearTimeout(collapseTimer);
+                collapseTimer = setTimeout(collapsePanel, 2500);
+            });
+        });
+    }
+
+    function buildRouteTabs(startName, endName) {
+        // Panel 内 tabs
+        routeTabsEl.innerHTML = '';
+        routeTabsEl.style.display = 'block';
+        allRoutes.forEach(function(route, i) {
+            var c = ROUTE_COLORS[i] || ROUTE_COLORS[ROUTE_COLORS.length-1];
+            var d = route.distance;
+            var distStr = d>=1000?(d/1000).toFixed(1)+'km':d+'m';
+            var t = Math.ceil(route.time/60)+'分钟';
+
+            var tab = document.createElement('span');
+            tab.className = 'rtab'+(i===0?' active':'');
+            tab.style.setProperty('--c', c.main);
+            tab.innerHTML = '<b>'+(c.label||('路线'+(i+1)))+'</b> '+distStr+' · '+t;
+            tab.addEventListener('click', (function(idx){ return function(){ selectRoute(idx); }; })(i));
+            routeTabsEl.appendChild(tab);
+        });
+
+        // 底部栏 tabs
+        bbTabs.innerHTML = '';
+        allRoutes.forEach(function(route, i) {
+            var d = route.distance;
+            var distStr = d>=1000?(d/1000).toFixed(1)+'km':d+'m';
+            var t = Math.ceil(route.time/60)+'′';
+
+            var tab = document.createElement('span');
+            tab.className = 'bb-tab'+(i===0?' active':'');
+            tab.textContent = (i===0?'推荐':'路线'+(i+1))+' '+distStr+' '+t;
+            tab.addEventListener('click', (function(idx){ return function(){ selectRoute(idx); }; })(i));
+            bbTabs.appendChild(tab);
+        });
+    }
+
+    /* ===========================================================
+       DOM 初始化
+       =========================================================== */
+    function initDOM() {
+        startInput   = document.getElementById('start-input');
+        endInput     = document.getElementById('end-input');
+        startSuggest = document.getElementById('start-suggest');
+        endSuggest   = document.getElementById('end-suggest');
+        navBtn       = document.getElementById('nav-btn');
+        routeInfo    = document.getElementById('route-info');
+        stepsList    = document.getElementById('steps-list');
+        statusEl     = document.getElementById('status');
+        clearBtn     = document.getElementById('clear-btn');
+        routeTabsEl  = document.getElementById('route-tabs');
+        panelEl      = document.getElementById('panel');
+        expandBtn    = document.getElementById('expand-btn');
+        bottomBar    = document.getElementById('bottom-bar');
+        bbTabs       = document.getElementById('bb-tabs');
+        bbDist       = document.getElementById('bb-dist');
+        bbTime       = document.getElementById('bb-time');
+        bbSteps      = document.getElementById('bb-steps');
+
+        detailCard   = document.getElementById('detail-card');
+        detailClose  = document.getElementById('detail-close');
+        dcTag        = document.getElementById('dc-tag');
+        dcName       = document.getElementById('dc-name');
+        dcDesc       = document.getElementById('dc-desc');
+        dcPhotos     = document.getElementById('dc-photos');
+        dcNavS       = document.getElementById('dc-nav-start');
+        dcNavE       = document.getElementById('dc-nav-end');
+
+        // 全局 distVal / timeVal 给 updateRouteDetail 用
+        distVal = document.getElementById('dist-val');
+        timeVal = document.getElementById('time-val');
+
+        startInput.addEventListener('input', function(){ renderSuggest(filterPOIs(this.value), startSuggest, this); });
+        startInput.addEventListener('blur',  function(){ setTimeout(function(){ startSuggest.style.display='none'; },200); });
+        startInput.addEventListener('focus', function(){ if(this.value) renderSuggest(filterPOIs(this.value), startSuggest, this); });
+        endInput.addEventListener('input', function(){ renderSuggest(filterPOIs(this.value), endSuggest, this); });
+        endInput.addEventListener('blur',  function(){ setTimeout(function(){ endSuggest.style.display='none'; },200); });
+        endInput.addEventListener('focus', function(){ if(this.value) renderSuggest(filterPOIs(this.value), endSuggest, this); });
+
+        document.getElementById('swap-btn').addEventListener('click', function(){
+            var t=startInput.value; startInput.value=endInput.value; endInput.value=t;
+        });
+
+        navBtn.addEventListener('click', function(){
+            // 态 1：搜索路线
+            if (navState === 'idle') {
+                var s=startInput.value.trim(), e=endInput.value.trim();
+                if(!s){ setStatus('请输入或选择起点',true); return; }
+                if(!e){ setStatus('请输入或选择终点',true); return; }
+                if(s===e){ setStatus('起点和终点不能相同',true); return; }
+                var sl=getCoords(s), el=getCoords(e);
+                if(!sl){ setStatus('未找到起点「'+s+'」',true); return; }
+                if(!el){ setStatus('未找到终点「'+e+'」',true); return; }
+                doRoute(sl, el, s, e);
+            }
+            // 态 2：开始导航
+            else if (navState === 'routes') {
+                startNavigation();
+            }
+            // 态 3：结束导航
+            else if (navState === 'navigating') {
+                stopNavigation();
+            }
+        });
+
+        expandBtn.addEventListener('click', function(){ if(collapseTimer)clearTimeout(collapseTimer); expandPanel(); });
+
+        clearBtn.addEventListener('click', function(){
+            clearRoutes();
+            routeInfo.style.display='none';
+            routeTabsEl.innerHTML=''; routeTabsEl.style.display='none';
+            bbTabs.innerHTML='';
+            bottomBar.classList.remove('show');
+            navState = 'idle';
+            navBtn.textContent = '🔍 搜索路线';
+            navBtn.classList.remove('nav-active');
+            setStatus('路线已清除');
+            expandPanel();
+        });
+
+        // 详情卡片关闭按钮 + 导航按钮
+        detailClose.addEventListener('click', hideDetail);
+        dcNavS.addEventListener('click', function(){
+            if (currentPoi) { startInput.value = currentPoi.name; hideDetail(); }
+        });
+        dcNavE.addEventListener('click', function(){
+            if (currentPoi) { endInput.value = currentPoi.name; hideDetail(); }
+        });
+
+        // 键盘方向键：导航模式下切换步骤
+        document.addEventListener('keydown', function(e){
+            if (navState !== 'navigating') return;
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { e.preventDefault(); navNextStep(); }
+            if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')   { e.preventDefault(); navPrevStep(); }
+        });
+    }
+
+    initMap();
+    initDOM();
+    </script>
+</body>
+</html>

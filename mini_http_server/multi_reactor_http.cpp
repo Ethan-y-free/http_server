@@ -57,11 +57,6 @@ public:
 		{
 			subLoops_[i] = std::make_unique<EventLoop>();
 
-			subThreads_.emplace_back([this, i]()
-			{
-				subLoops_[i]->Loop(); // 接受内核，用户态的操作，有回调
-			});
-
 			timerWheels_[i] = std::make_unique<TimerWheel>(60, 1000);
 			subLoops_[i]->RunInLoop([this, i]() // 内部程序初始化或内部操作调用
 				{
@@ -94,6 +89,15 @@ public:
 					ch->EnableRead();
 					timerChannels_[i] = std::move(ch);
 				});
+		}
+
+		// ★ 所有 RunInLoop 执行完毕后再启动子线程，避免 tid_ 竞争
+		for (int i = 0; i < subReactorCount; ++i)
+		{
+			subThreads_.emplace_back([this, i]()
+			{
+				subLoops_[i]->Loop(); // 接受内核，用户态的操作，有回调
+			});
 		}
 
 		listen_sock_.SetReuseAddr();

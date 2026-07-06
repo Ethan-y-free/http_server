@@ -1,5 +1,5 @@
 /**
- * channel.h —— Channel 事件分发器（骨架版）
+ * channel.h —— Channel 事件分发器
  *
  * Channel 负责：一个 fd + 它关心的事件 + 事件到了做什么
  * 把"fd → epoll 事件 → 回调"绑在一起

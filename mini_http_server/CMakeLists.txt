@@ -19,3 +19,9 @@ add_executable(http_server
 )
 
 target_link_libraries(http_server pthread)
+
+# 编译后自动复制 www 目录到二进制所在目录
+add_custom_command(TARGET http_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_SOURCE_DIR}/www"
+    "$<TARGET_FILE_DIR:http_server>/www")

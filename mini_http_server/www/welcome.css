@@ -1,0 +1,90 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+    height: 100%; font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    overflow: hidden; display: flex; align-items: center; justify-content: center;
+}
+
+/* 背景 */
+.wl-bg {
+    position: fixed; inset: 0; z-index: -1;
+    background: linear-gradient(160deg, #1a3c6e 0%, #0f0c29 40%, #1a1a4e 70%, #1a5c3a 100%);
+}
+.wl-bg::before {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(ellipse at 70% 30%, rgba(26,108,255,0.18) 0%, transparent 50%),
+                radial-gradient(ellipse at 30% 70%, rgba(34,172,56,0.1) 0%, transparent 50%);
+    animation: wlBgDrift 10s ease-in-out infinite alternate;
+}
+@keyframes wlBgDrift {
+    0%   { opacity: 0.7; }
+    100% { opacity: 1; }
+}
+
+/* 卡片 */
+.wl-card {
+    width: min(480px, calc(100vw - 32px));
+    background: rgba(255,255,255,0.06);
+    backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 20px; padding: 44px 36px 36px;
+    text-align: center;
+    animation: wlIn 0.7s cubic-bezier(0.34,1.56,0.64,1);
+    will-change: transform, opacity;
+}
+@keyframes wlIn {
+    from { transform: translateY(50px) scale(0.92); opacity: 0; }
+    to   { transform: translateY(0)    scale(1);    opacity: 1; }
+}
+
+.wl-greeting { font-size: 14px; color: rgba(255,255,255,0.5); margin-bottom: 4px; animation: wlFade 0.8s 0.1s both; }
+.wl-card h1 { font-size: 28px; color: #fff; font-weight: 700; margin-bottom: 6px; animation: wlFade 0.8s 0.2s both; }
+.wl-sub { font-size: 14px; color: rgba(255,255,255,0.45); margin-bottom: 28px; animation: wlFade 0.8s 0.3s both; }
+@keyframes wlFade { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+/* 功能列表 */
+.wl-features { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 28px; }
+.wl-feat {
+    display: flex; align-items: center; gap: 10px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; padding: 14px;
+    transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+    will-change: transform;
+}
+.wl-feat:nth-child(1) { animation: wlFade 0.8s 0.35s both; }
+.wl-feat:nth-child(2) { animation: wlFade 0.8s 0.45s both; }
+.wl-feat:nth-child(3) { animation: wlFade 0.8s 0.55s both; }
+.wl-feat:nth-child(4) { animation: wlFade 0.8s 0.65s both; }
+.wl-feat:hover { background: rgba(255,255,255,0.12); transform: translateY(-2px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
+.wf-icon { font-size: 22px; flex-shrink: 0; transition: transform 0.3s ease; }
+.wl-feat:hover .wf-icon { transform: scale(1.2); }
+.wf-text { font-size: 14px; color: rgba(255,255,255,0.75); }
+
+/* 按钮 */
+.wl-btn {
+    width: 100%; padding: 16px 0; border: none; border-radius: 12px;
+    cursor: pointer; font-size: 17px; font-weight: 600;
+    background: linear-gradient(135deg, #1a6cff, #1557d4);
+    color: #fff; box-shadow: 0 4px 20px rgba(26,108,255,0.3);
+    transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+    position: relative; overflow: hidden;
+    animation: wlFade 0.8s 0.75s both;
+}
+.wl-btn::after {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(135deg, transparent 40%, rgba(255,255,255,0.1) 50%, transparent 60%);
+    transform: translateX(-100%); transition: transform 0.6s ease;
+}
+.wl-btn:hover::after { transform: translateX(100%); }
+.wl-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(26,108,255,0.45); }
+.wl-btn:active { transform: scale(0.97) translateY(0); transition: transform 0.1s; }
+
+.wl-logout {
+    margin-top: 16px; padding: 8px 0; width: 100%;
+    background: none; border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; color: rgba(255,255,255,0.35);
+    font-size: 13px; cursor: pointer;
+    transition: all 0.25s ease;
+    animation: wlFade 0.8s 0.85s both;
+}
+.wl-logout:hover { color: rgba(255,255,255,0.7); border-color: rgba(255,255,255,0.25); background: rgba(255,255,255,0.03); }

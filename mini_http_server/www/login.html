@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 — 江财麦庐园导航</title>
+    <link rel="stylesheet" href="/login.css">
+</head>
+<body>
+    <div class="login-bg"></div>
+
+    <div class="login-card" id="login-card">
+        <div class="lc-icon">🗺️</div>
+        <h2>江财·麦庐园导航</h2>
+        <p class="lc-sub">江西财经大学麦庐园校区智慧导览系统</p>
+
+        <form id="login-form" autocomplete="off">
+            <div class="input-wrap">
+                <span class="iw-icon">🏫</span>
+                <select id="school" required>
+                    <option value="" disabled selected>请选择学院</option>
+                </select>
+            </div>
+            <div class="input-wrap">
+                <span class="iw-icon">🪪</span>
+                <input id="student-id" type="text" placeholder="请输入学号" autocomplete="off" required>
+            </div>
+            <div class="lc-error" id="login-error"></div>
+            <button type="submit" class="lc-btn" id="login-btn">
+                <span>登 录</span>
+            </button>
+        </form>
+
+        <p class="lc-hint">测试数据见登录页底部</p>
+    </div>
+
+    <!-- 测试数据提示 -->
+    <div class="test-data" id="test-data">
+        <div class="td-toggle" id="td-toggle">📋 查看测试账号</div>
+        <table class="td-table" id="td-table" style="display:none">
+            <thead><tr><th>学院</th><th>学号</th><th>姓名</th></tr></thead>
+            <tbody id="td-body"></tbody>
+        </table>
+    </div>
+
+    <script>
+    (function(){
+        // ============================================================
+        // 测试数据：(学院, 学号) → 真实姓名
+        // 你可以在这里增减数据
+        // ============================================================
+        var STUDENT_DB = [
+            { school: '软件与物联网工程学院', id: '0254400', name: '鄢成' },
+            { school: '软件与物联网工程学院', id: '0254424', name: '孙轶鸣' },
+            { school: '信息管理学院',         id: '0254101', name: '张明远' },
+            { school: '统计学院',             id: '0254201', name: '李晓雨' },
+            { school: '工商管理学院',         id: '0254301', name: '王子涵' },
+            { school: '艺术学院',             id: '0254401', name: '陈思琪' },
+            { school: '法学院',               id: '0254501', name: '赵文博' },
+            { school: '外国语学院',           id: '0254601', name: '刘佳慧' }
+        ];
+
+        // ---- 填充学院下拉框 ----
+        var schools = [];
+        STUDENT_DB.forEach(function(s){
+            if (schools.indexOf(s.school) === -1) schools.push(s.school);
+        });
+        var schoolSelect = document.getElementById('school');
+        schools.forEach(function(s){
+            var opt = document.createElement('option');
+            opt.value = s;
+            opt.textContent = s;
+            schoolSelect.appendChild(opt);
+        });
+
+        // ---- 填充测试数据表格 ----
+        var tbody = document.getElementById('td-body');
+        STUDENT_DB.forEach(function(s){
+            var tr = document.createElement('tr');
+            tr.innerHTML = '<td>' + s.school + '</td><td>' + s.id + '</td><td>' + s.name + '</td>';
+            tbody.appendChild(tr);
+        });
+        document.getElementById('td-toggle').addEventListener('click', function(){
+            var tbl = document.getElementById('td-table');
+            tbl.style.display = (tbl.style.display === 'none') ? '' : 'none';
+        });
+
+        // ---- 登录逻辑 ----
+        var form  = document.getElementById('login-form');
+        var errEl = document.getElementById('login-error');
+        var btn   = document.getElementById('login-btn');
+        var card  = document.getElementById('login-card');
+
+        form.addEventListener('submit', function(e){
+            e.preventDefault();
+            var school = document.getElementById('school').value;
+            var sid    = document.getElementById('student-id').value.trim();
+
+            if (!school || !sid) {
+                errEl.textContent = '请选择学院并输入学号';
+                errEl.style.display = 'block';
+                return;
+            }
+
+            btn.classList.add('loading');
+            btn.innerHTML = '<span>验证中…</span>';
+            errEl.style.display = 'none';
+
+            setTimeout(function(){
+                // 匹配数据库
+                var matched = null;
+                for (var i = 0; i < STUDENT_DB.length; i++) {
+                    if (STUDENT_DB[i].school === school && STUDENT_DB[i].id === sid) {
+                        matched = STUDENT_DB[i];
+                        break;
+                    }
+                }
+
+                if (matched) {
+                    sessionStorage.setItem('auth', '1');
+                    sessionStorage.setItem('user',     matched.name);
+                    sessionStorage.setItem('school',   matched.school);
+                    sessionStorage.setItem('sid',      matched.id);
+                    card.classList.add('success');
+                    setTimeout(function(){
+                        window.location.href = '/welcome.html';
+                    }, 400);
+                } else {
+                    btn.classList.remove('loading');
+                    btn.innerHTML = '<span>登 录</span>';
+                    errEl.textContent = '学院与学号不匹配，请检查';
+                    errEl.style.display = 'block';
+                    card.classList.add('shake');
+                    setTimeout(function(){ card.classList.remove('shake'); }, 500);
+                }
+            }, 600);
+        });
+
+        // 已登录直接跳转
+        if (sessionStorage.getItem('auth') === '1') {
+            window.location.href = '/welcome.html';
+        }
+    })();
+    </script>
+</body>
+</html>

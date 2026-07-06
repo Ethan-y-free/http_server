@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>欢迎 — 江财麦庐园导航</title>
+    <link rel="stylesheet" href="/welcome.css">
+</head>
+<body>
+    <div class="wl-bg"></div>
+
+    <div class="wl-card">
+        <div class="wl-greeting" id="greeting"></div>
+        <h1 id="wl-user">同学</h1>
+        <p class="wl-sub">欢迎使用江财麦庐园智慧导览系统</p>
+
+        <div class="wl-features">
+            <div class="wl-feat">
+                <span class="wf-icon">🗺️</span>
+                <span class="wf-text">校园地图导航</span>
+            </div>
+            <div class="wl-feat">
+                <span class="wf-icon">🚶</span>
+                <span class="wf-text">步行路线规划</span>
+            </div>
+            <div class="wl-feat">
+                <span class="wf-icon">📷</span>
+                <span class="wf-text">建筑实景查看</span>
+            </div>
+            <div class="wl-feat">
+                <span class="wf-icon">🏫</span>
+                <span class="wf-text">29栋建筑全覆盖</span>
+            </div>
+        </div>
+
+        <button class="wl-btn" id="enter-btn">
+            <span>🚀 进入导航系统</span>
+        </button>
+
+        <button class="wl-logout" id="logout-btn">退出登录</button>
+    </div>
+
+    <script>
+    (function(){
+        // 未登录跳回登录页
+        if (sessionStorage.getItem('auth') !== '1') {
+            window.location.href = '/login.html';
+            return;
+        }
+
+        var user = sessionStorage.getItem('user') || '同学';
+        document.getElementById('wl-user').textContent = user + '，你好！';
+        document.getElementById('greeting').textContent = getGreeting();
+
+        document.getElementById('enter-btn').addEventListener('click', function(){
+            window.location.href = '/map.html';
+        });
+
+        document.getElementById('logout-btn').addEventListener('click', function(){
+            sessionStorage.removeItem('auth');
+            sessionStorage.removeItem('user');
+            window.location.href = '/login.html';
+        });
+
+        function getGreeting() {
+            var h = new Date().getHours();
+            if (h < 6)  return '🌙 夜深了';
+            if (h < 9)  return '🌅 早上好';
+            if (h < 12) return '☀️ 上午好';
+            if (h < 14) return '🌤 中午好';
+            if (h < 18) return '🌻 下午好';
+            return '🌆 晚上好';
+        }
+    })();
+    </script>
+</body>
+</html>

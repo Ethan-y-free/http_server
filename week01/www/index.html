@@ -3,52 +3,82 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>tiny-http — 高性能 HTTP 服务器</title>
-    <link rel="stylesheet" href="/style.css">
+    <title>登录 — 江财麦庐园导航</title>
+    <link rel="stylesheet" href="/login.css">
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🚀 tiny-http</h1>
-            <p class="subtitle">一个从零手写的高性能 C++ HTTP 服务器</p>
-        </header>
+    <div class="login-bg"></div>
 
-        <main>
-            <section class="card">
-                <h2>✨ 功能特性</h2>
-                <ul>
-                    <li>主从 Reactor 架构（MainReactor + SubReactor）</li>
-                    <li>Epoll ET 边缘触发 + 非阻塞 I/O</li>
-                    <li>HTTP/1.1 长连接（Keep-Alive）</li>
-                    <li>状态机 HTTP 请求解析</li>
-                    <li>静态文件服务 + MIME 类型自动检测</li>
-                    <li>线程池异步处理</li>
-                </ul>
-            </section>
+    <div class="login-card" id="login-card">
+        <div class="lc-icon">🗺️</div>
+        <h2>江财·麦庐园导航</h2>
+        <p class="lc-sub">江西财经大学麦庐园校区智慧导览系统</p>
 
-            <section class="card">
-                <h2>📊 压测数据</h2>
-                <table>
-                    <tr><th>场景</th><th>单 Reactor</th><th>主从 Reactor</th></tr>
-                    <tr><td>keep-alive, 1000 并发</td><td>8,521 QPS</td><td>3,528 QPS</td></tr>
-                    <tr><td>短连接, 200 并发</td><td>2,278 QPS</td><td>782 QPS</td></tr>
-                </table>
-                <p class="note">测试环境：VMware Ubuntu 22.04, 4 核 8G | ab -n 100000</p>
-            </section>
+        <form id="login-form" autocomplete="off">
+            <div class="input-wrap">
+                <span class="iw-icon">👤</span>
+                <input id="username" type="text" placeholder="请输入用户名" autocomplete="off" required>
+            </div>
+            <div class="input-wrap">
+                <span class="iw-icon">🔒</span>
+                <input id="password" type="password" placeholder="请输入密码" autocomplete="off" required>
+            </div>
+            <div class="lc-error" id="login-error"></div>
+            <button type="submit" class="lc-btn" id="login-btn">
+                <span>登 录</span>
+            </button>
+        </form>
 
-            <section class="card">
-                <h2>🧪 测试端点</h2>
-                <ul>
-                    <li><a href="/">GET /</a> — 本页面</li>
-                    <li><a href="/style.css">GET /style.css</a> — 样式表</li>
-                    <li><a href="/nonexistent.html">GET /nonexistent.html</a> — 404 测试</li>
-                </ul>
-            </section>
-        </main>
-
-        <footer>
-            <p>Built with ❤️ using C++17 | 2026</p>
-        </footer>
+        <p class="lc-hint">演示账号：软工257 / 123456</p>
     </div>
+
+    <script>
+    (function(){
+        var form   = document.getElementById('login-form');
+        var errEl  = document.getElementById('login-error');
+        var btn    = document.getElementById('login-btn');
+        var card   = document.getElementById('login-card');
+
+        form.addEventListener('submit', function(e){
+            e.preventDefault();
+            var u = document.getElementById('username').value.trim();
+            var p = document.getElementById('password').value.trim();
+
+            if (!u || !p) {
+                errEl.textContent = '请输入用户名和密码';
+                errEl.style.display = 'block';
+                return;
+            }
+
+            btn.classList.add('loading');
+            btn.innerHTML = '<span>验证中…</span>';
+            errEl.style.display = 'none';
+
+            // 模拟网络延迟
+            setTimeout(function(){
+                if (u === '软工257' && p === '123456') {
+                    sessionStorage.setItem('auth', '1');
+                    sessionStorage.setItem('user', u);
+                    card.classList.add('success');
+                    setTimeout(function(){
+                        window.location.href = '/welcome.html';
+                    }, 400);
+                } else {
+                    btn.classList.remove('loading');
+                    btn.innerHTML = '<span>登 录</span>';
+                    errEl.textContent = '用户名或密码错误';
+                    errEl.style.display = 'block';
+                    card.classList.add('shake');
+                    setTimeout(function(){ card.classList.remove('shake'); }, 500);
+                }
+            }, 800);
+        });
+
+        // 已登录直接跳转
+        if (sessionStorage.getItem('auth') === '1') {
+            window.location.href = '/welcome.html';
+        }
+    })();
+    </script>
 </body>
 </html>

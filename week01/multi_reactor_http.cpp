@@ -40,7 +40,7 @@ constexpr int MAX_KEEPALIVE_REQUESTS = 10000;
 constexpr int TIMEOUT_SECONDS = 60;   // 空闲超时秒数
 constexpr int TIMEOUT_TICK_SEC = 1;    // timerfd 每秒触发一次
 
-static HttpStaticHandler g_handler("/home/ethany/.vs/http_server/8043fcde-127c-492a-a0b0-72c8fb565f69/src/week01/www");
+static HttpStaticHandler g_handler("www");
 static void GenerateResponse(const HttpRequest& req, Buffer* output)
 {
 	g_handler.HandleRequest(req, output);
