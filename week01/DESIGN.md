@@ -3813,3 +3813,514 @@ LOG_ERROR << "ReadFd fd=" << fd << ": " << std::strerror(savedErrno);
 | 5 | 集成到 `multi_reactor_http.cpp` | 替换 std::cerr/cout |
 | 6 | CMakeLists.txt 无需改动 | 全是 header-only |
 | 7 | 编译测试 | 启动 tail -f server.log 验证 |
+
+---
+
+# §二十：模块整合 — HTTP Server v1.0 架构
+
+---
+
+## 二十.1 问题
+
+当前 `multi_reactor_http.cpp`（423 行）所有逻辑塞在一个文件：
+
+```
+multi_reactor_http.cpp
+├── Connection 结构体          ← 纯数据，无行为
+├── MultiReactorServer 类      ← Accept + 连接管理 + 定时器 + 日志 + HTTP
+└── main()                     ← 配置 + 组装混在一起
+```
+
+三个具体痛点：
+
+1. **协议耦合**：`OnRead()` 里 TCP 收发和 HTTP 解析焊死。做 WebSocket / RPC 复用不了任何代码
+2. **职责散落**：改一个"超时时间"，timerfd/TimerWheel/AddOrRefresh 散在 4 个位置，漏一个就 bug
+3. **不可单测**：连接逻辑、事件分发都绑在 `MultiReactorServer` 里，测一个连接流程必须启动整个服务器
+
+## 二十.2 目标架构
+
+```
+┌─────────────────────────────────────────────────────┐
+│  main.cpp                                           │
+│  配置 → 组装 → 启动 → 等待退出                        │
+│                                                     │
+│  ┌─────────────────────────────────────────────────┐│
+│  │  TcpServer                                      ││
+│  │  Accept → RoundRobin → 派发到 SubReactor          ││
+│  │  只持有 listen fd + SubReactor[]                  ││
+│  │                                                  ││
+│  │  ┌─────────────────┐  ┌─────────────────┐       ││
+│  │  │  SubReactor[0]  │  │  SubReactor[1]  │  ...  ││
+│  │  │  EventLoop      │  │  EventLoop      │       ││
+│  │  │  TimerWheel     │  │  TimerWheel     │       ││
+│  │  │  LogBuffer      │  │  LogBuffer      │       ││
+│  │  │  map<fd,Conn>   │  │  map<fd,Conn>   │       ││
+│  │  │                 │  │                 │       ││
+│  │  │  TcpConnection  │  │  TcpConnection  │       ││
+│  │  │  TcpConnection  │  │  TcpConnection  │       ││
+│  │  └─────────────────┘  └─────────────────┘       ││
+│  └─────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────┘
+```
+
+**核心原则**：
+- 每个 SubReactor 的数据只有自己的线程碰 → 无锁
+- TcpConnection 只管 TCP，不管协议
+- HTTP 逻辑通过回调挂上去
+
+## 二十.3 新增模块
+
+| 模块 | 文件 | 说明 |
+|------|------|------|
+| TcpConnection | `tcp_connection.h` | 通用 TCP 连接，协议无关 |
+| SubReactor | `sub_reactor.h` | 子线程封装：EventLoop + TimerWheel + LogBuffer + 连接表 |
+| TcpServer | `tcp_server.h` | 服务器入口：Accept + 派发 + 生命周期 |
+
+已有模块不变：`socket_raii.h`、`epoll.h`、`channel.h`、`buffer.h`、`eventloop.h`、`threadpool.h`、`http_parser.h`、`http_static_handler.h`、`timer_wheel.h`、`async_logger/*`
+
+---
+
+## 二十.4 TcpConnection — 通用 TCP 连接
+
+### 职责
+
+管理**一个** TCP 连接的生命周期：收数据 → 回调 → 发数据 → 关闭
+
+### 它知道什么
+
+- Socket fd、输入输出缓冲区
+- 自己属于哪个 EventLoop
+- 4 个回调（上层通过回调注入业务逻辑）
+
+### 它不知道什么
+
+- 收上来的字节是什么协议（HTTP？WebSocket？）
+- 回调里做了什么
+
+### 状态机
+
+```
+  Connecting ──→ Connected ──→ Disconnecting ──→ Disconnected
+                     │                               ↑
+                     └───────────────────────────────┘
+                              (出错直接断开)
+```
+
+### API
+
+```cpp
+class TcpConnection
+{
+public:
+    // 回调类型
+    using MessageCallback  = std::function<void(TcpConnection*, Buffer*)>;
+    using WriteCompleteCallback = std::function<void(TcpConnection*)>;
+    using CloseCallback    = std::function<void(TcpConnection*)>;
+    using ErrorCallback    = std::function<void(TcpConnection*, int err)>;
+
+    // 构造：接管 fd，绑定到指定 EventLoop
+    TcpConnection(int fd, EventLoop* loop);
+
+    // 禁止拷贝，允许移动
+    TcpConnection(const TcpConnection&) = delete;
+    TcpConnection& operator=(const TcpConnection&) = delete;
+
+    ~TcpConnection();  // 确保 fd 关闭
+
+    // ---- 回调设置 ----
+    void SetMessageCallback(MessageCallback cb);
+    void SetWriteCompleteCallback(WriteCompleteCallback cb);
+    void SetCloseCallback(CloseCallback cb);
+    void SetErrorCallback(ErrorCallback cb);
+
+    // ---- 业务层操作 ----
+    void Send(const void* data, size_t len);   // 写入 outputBuffer → 尝试发送
+    void Send(Buffer* data);                    // 同上，直接接管 Buffer
+    void Shutdown();                            // 优雅关闭（写完剩余数据再关）
+    void ForceClose();                          // 立即关闭
+
+    // ---- 状态查询 ----
+    int Fd() const;
+    EventLoop* OwnerLoop() const;
+
+    // ---- 内部（EventLoop 调用）----
+    void OnRead();   // 从 fd 读到 inputBuffer → 调 MessageCallback
+    void OnWrite();  // 从 outputBuffer 写到 fd → 写完了调 WriteCompleteCallback
+    void OnClose();  // clean up
+
+private:
+    void FlushWrite();  // 尝试发送 outputBuffer，EAGAIN 时注册写事件
+
+    // ---- 数据成员 ----
+    Socket sock_;
+    std::unique_ptr<Channel> channel_;
+    Buffer inputBuffer_;
+    Buffer outputBuffer_;
+    EventLoop* ownerLoop_;
+
+    // 状态
+    enum State { Connecting, Connected, Disconnecting, Disconnected };
+    State state_ = Connecting;
+
+    // 4 个回调
+    MessageCallback messageCallback_;
+    WriteCompleteCallback writeCompleteCallback_;
+    CloseCallback closeCallback_;
+    ErrorCallback errorCallback_;
+};
+```
+
+### Send() 行为
+
+```
+Send(data)
+  ├─ 如果 outputBuffer 为空 且 直接 write() 成功 → 完毕
+  ├─ 如果 write() 返回 EAGAIN → 剩余数据塞 outputBuffer → EnableWrite
+  └─ outputBuffer 不为空 → 追加数据 → 等待 OnWrite 回调继续发
+```
+
+### 生命周期示意图
+
+```
+连接建立：
+  1. Acceptor 拿到 client_fd
+  2. TcpServer 创建 TcpConnection(fd, subLoop)
+  3. 设置 4 个回调
+  4. 注册到 SubReactor 的连接表
+  5. TcpConnection 注册 fd 的 Read 事件
+
+收数据流程：
+  客户端发来数据
+  → EventLoop::Wait() 返回该 fd 的 EPOLLIN
+  → Channel::HandleEvent() → TcpConnection::OnRead()
+  → ReadFd → inputBuffer
+  → MessageCallback(this, &inputBuffer)    // ← 业务逻辑在这里
+  → 业务调 Send() 把响应写入 outputBuffer
+  → FlushWrite()
+
+关闭流程（两种触发路径）：
+  [主动] 业务调 Shutdown() → 发完 outputBuffer → 摘 fd → ForceClose()
+  [被动] 对端关闭 → OnRead() 读到 0 → OnClose()
+  [被动] 定时器超时 → SubReactor 调 ForceClose()
+  [被动] 出错 → HandleError() → OnClose()
+
+OnClose() 执行步骤：
+  1. 从 EventLoop 摘除 Channel
+  2. 调 CloseCallback (SubReactor 从连接表删除)
+  3. close(fd)
+```
+
+---
+
+## 二十.5 SubReactor — 子线程封装
+
+### 职责
+
+封装**一个**子线程的全部资源。TcpServer 只通过 SubReactor 的公开接口操作，不碰内部细节。
+
+### API
+
+```cpp
+class SubReactor
+{
+public:
+    // idleTimeoutMs: 连接空闲超时（毫秒）
+    // logWriter:    全局异步日志后台线程指针
+    SubReactor(int idleTimeoutMs, AsyncLogWriter* logWriter);
+
+    ~SubReactor();  // Stop + Join + 清理 timerfd
+
+    // ---- 生命周期 ----
+    void Start();   // 启动 EventLoop 线程
+    void Stop();    // Quit + Join
+
+    // ---- 操作 ----
+    void AddConnection(int fd, TcpConnection::MessageCallback onMessage);
+    void RunInLoop(std::function<void()> task);
+
+    // ---- 只读 ----
+    EventLoop* Loop() const;
+
+private:
+    void OnTimerTick();  // timerfd 到期 → TimerWheel::Tick() → 踢人 + Flush 日志
+
+    std::unique_ptr<EventLoop> loop_;
+    std::unique_ptr<TimerWheel> timerWheel_;
+    std::unique_ptr<LogBuffer>  logBuffer_;
+    std::unique_ptr<Channel>    timerChannel_;
+    int timerFd_ = -1;
+
+    std::unordered_map<int, TcpConnection> connections_;
+    std::thread thread_;
+
+    int idleTimeoutMs_;
+    AsyncLogWriter* logWriter_;
+};
+```
+
+### 创建流程（构造函数）
+
+```
+1. 创建 EventLoop
+2. 创建 LogBuffer（绑到 g_logWriter）
+3. 创建 TimerWheel(60格, 1秒tick)
+4. 把 timerfd 创建 + Channel 注册 defer 到 EventLoop 线程执行
+   （RunInLoop 里操作，保证线程安全）
+```
+
+### Start() 流程
+
+```
+1. 启动子线程：thread_ = std::thread([this] {
+       Logger::SetCurrentLogBuffer(logBuffer_.get());  // 绑定 thread_local
+       loop_->Loop();
+   })
+```
+
+### AddConnection() 流程
+
+```
+TcpConnection conn(fd, loop_.get());
+conn.SetMessageCallback(onMessage);
+conn.SetCloseCallback([this](TcpConnection* c) {
+    connections_.erase(c->Fd());  // 从表里删掉
+});
+// TimerWheel 注册超时
+// connections_[fd] = std::move(conn);
+// 注册 fd 的 Read 事件
+```
+
+### 定时器 Tick 回调（每秒一次）
+
+```
+1. read(timerFd_) 消耗到期计数
+2. for each 到期: TimerWheel::Tick()
+3. 对每个过期 fd → connections_[fd].ForceClose()
+4. logBuffer_->Flush()   // 每秒刷盘
+```
+
+---
+
+## 二十.6 TcpServer — 服务器入口
+
+### 职责
+
+把 SubReactor 数组、listen socket、accept 派发串起来。TcpServer 本身**不持有连接**。
+
+### API
+
+```cpp
+struct TcpServerConfig
+{
+    uint16_t port = 8888;
+    int subReactorCount = 4;
+    int idleTimeoutMs = 60000;           // 空闲超时
+    TcpConnection::MessageCallback onMessage;  // 业务处理（必填）
+};
+
+class TcpServer
+{
+public:
+    TcpServer(const TcpServerConfig& config, AsyncLogWriter* logWriter);
+
+    ~TcpServer();  // 逐 SubReactor Stop + Join
+
+    void Start();  // 创建 SubReactor、启动线程、bind/listen、注册 Accept
+
+private:
+    void OnAccept();  // accept → RoundRobin → SubReactor::AddConnection
+
+    Socket listenSock_;
+    std::unique_ptr<Channel> listenChannel_;
+    std::vector<std::unique_ptr<SubReactor>> subReactors_;
+
+    EventLoop mainLoop_;       // 主 Reactor（只跑 Accept）
+    TcpServerConfig config_;
+    AsyncLogWriter* logWriter_;
+
+    std::atomic<int> roundRobin_{0};
+};
+```
+
+### 构造 + 启动流程
+
+```
+1. 保存 config_ 和 logWriter_
+2. Start() 被调用：
+   a. 创建 subReactorCount_ 个 SubReactor
+   b. 逐个 SubReactor::Start()   ← 先启动子线程
+   c. bind + listen               ← 再绑端口（绑失败了子线程还没 Start，不崩）
+   d. 注册 listen fd 的 EPOLLIN → OnAccept
+   e. mainLoop_.Loop()            ← 进入主事件循环
+```
+
+### 析构流程
+
+```
+1. 摘除 listen fd → mainLoop_.RemoveChannel
+2. 逐 SubReactor::Stop() → Quit + Join
+3. 子线程全部退出后析构
+```
+
+---
+
+## 二十.7 main.cpp — 组装层
+
+```cpp
+#include "tcp_server.h"
+#include "http_parser.h"
+#include "http_static_handler.h"
+#include "async_logger/logger.h"
+
+int main()
+{
+    // ---------- 1. 基础设施 ----------
+    AsyncLogWriter logWriter("server.log");
+    g_logWriter = &logWriter;
+    logWriter.Start();
+
+    // ---------- 2. 业务回调 ----------
+    HttpStaticHandler handler("www");
+
+    auto onMessage = [&handler](TcpConnection* conn, Buffer* input) {
+        HttpRequestParser parser;
+        while (input->ReadableBytes() > 0)
+        {
+            auto result = parser.Parse(input);
+            if (result == HttpRequestParser::PARSE_NEED_MORE) break;
+            if (result == HttpRequestParser::PARSE_ERROR)   { conn->ForceClose(); return; }
+
+            const HttpRequest& req = parser.GetRequest();
+            Buffer response;
+            handler.HandleRequest(req, &response);
+            conn->Send(response.Peek(), response.ReadableBytes());
+
+            if (!req.IsKeepAlive()) { conn->Shutdown(); return; }
+            parser.Reset();
+        }
+    };
+
+    // ---------- 3. 组装 ----------
+    TcpServerConfig config;
+    config.port = 8888;
+    config.subReactorCount = 4;
+    config.idleTimeoutMs = 60000;
+    config.onMessage = onMessage;
+
+    // ---------- 4. 启动 ----------
+    TcpServer server(config, &logWriter);
+    server.Start();
+
+    logWriter.Stop();
+    return 0;
+}
+```
+
+`main()` 只做了 4 件事：初始化基础设施 → 定义业务回调 → 填配置 → 启动。
+
+---
+
+## 二十.8 数据流（一次 HTTP 请求的完整路径）
+
+```
+客户端 connect()
+      │
+      ▼
+mainLoop::Wait() 返回 listen_fd EPOLLIN
+      │
+      ▼
+TcpServer::OnAccept()
+  ├─ accept() → client_fd
+  ├─ RoundRobin 选 SubReactor[idx]
+  └─ subReactors_[idx]->AddConnection(client_fd, onMessage)
+          │
+          ▼ (以下全在子线程 idx 执行)
+      SubReactor::AddConnection()
+        ├─ 创建 TcpConnection(fd, loop_)
+        ├─ 设置 MessageCallback = onMessage（HTTP 解析 + 静态文件）
+        ├─ 设置 CloseCallback = 从 connections_ 删除
+        ├─ timerWheel_->AddOrRefresh(fd, 60000ms)
+        └─ 注册 EPOLLIN
+
+客户端发送 HTTP 请求：
+      subLoop::Wait() 返回 client_fd EPOLLIN
+        → Channel::HandleEvent()
+        → TcpConnection::OnRead()
+          → inputBuffer.ReadFd(fd)
+          → MessageCallback(this, &inputBuffer)    // 即 main.cpp 中的 onMessage
+            → HttpParser::Parse()
+            → HttpStaticHandler::HandleRequest()
+            → conn->Send(response)                  // 写入 outputBuffer → FlushWrite
+          → FlushWrite()
+
+客户端关闭（或超时）：
+      TcpConnection::OnClose()
+        → CloseCallback (SubReactor 从 connections_ 删除)
+        → 从 EventLoop 摘 Channel
+        → close(fd)
+```
+
+---
+
+## 二十.9 与旧版 multi_reactor_http.cpp 的对照
+
+| 旧版 | 新版 |
+|------|------|
+| 一个 main.cpp 423 行 | 12 个独立模块 + 30 行 main.cpp |
+| Connection 结构体（纯数据） | TcpConnection 类（自管理生命周期） |
+| MultiReactorServer 管一切 | TcpServer（派发）+ SubReactor（子线程）+ TcpConnection（连接） |
+| OnRead 里 TCP + HTTP 耦合 | TcpConnection::OnRead → MessageCallback → HTTP 逻辑在 main.cpp |
+| 5 个并行 vector | SubReactor 封装，一个 vector 搞定 |
+| 定时器/日志散落多处 | SubReactor 内部闭环 |
+| 写单元测试需要启动整个服务器 | TcpConnection 可独立测试 |
+
+---
+
+## 二十.10 线程安全保证（无锁架构）
+
+```
+mainLoop_（主线程）:
+  ├─ 只操作 listen_fd
+  └─ OnAccept() → RunInLoop(task) 投递到子线程
+      │
+      ▼
+subLoop_[i]（子线程 i）:
+  ├─ EventLoop::Loop() 只在本线程跑
+  ├─ connections_ 只被本线程访问
+  ├─ timerWheel_ 只被本线程访问
+  ├─ logBuffer_ 只被本线程写 → Flush() 提交到后台日志线程
+  └─ 不加任何锁
+```
+
+**跨线程通信**：mainLoop → subLoop 通过 `EventLoop::RunInLoop()`（内部用 eventfd 唤醒）。subLoop → mainLoop 无反向通信不需要。
+
+---
+
+## 二十.11 Keep-Alive 处理
+
+Keep-Alive 由**业务层（main.cpp 中的 onMessage）**决定，TcpConnection 不内置：
+
+```cpp
+// onMessage 中：
+if (!req.IsKeepAlive()) {
+    conn->Shutdown();   // 优雅关闭
+    return;
+}
+parser.Reset();  // 重置解析器，准备下一个请求
+```
+
+TcpConnection 不关心 KeepAlive 语义。业务层通过 `Shutdown()` vs `ForceClose()` 区分优雅关闭和强制关闭。
+
+---
+
+## 二十.12 Day 19 实现清单
+
+| # | 任务 | 产出 |
+|---|------|------|
+| 1 | 创建 `tcp_connection.h` | TcpConnection 类 |
+| 2 | 创建 `sub_reactor.h` | SubReactor 类 |
+| 3 | 创建 `tcp_server.h` | TcpServer + TcpServerConfig |
+| 4 | 创建 `main.cpp` | 组装入口（~30行） |
+| 5 | 更新 `CMakeLists.txt` | 添加 main 目标 |
+| 6 | 编译测试 | 浏览器访问，验证 login → welcome → map |
+| 7 | 对照旧版 `multi_reactor_http.cpp` | 验证功能等价，保留旧文件不动 |
