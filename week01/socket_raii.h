@@ -1,12 +1,3 @@
-/**
- * socket_raii.h —— RAII Socket 封装类
- *
- * 你要实现的内容用 TODO 标出。
- * 完整参考版：reference/socket_raii_full.h（写不出来时再看）
- *
- * 风格：Allman 大括号，4 空格缩进，if ( 括号后空格
- */
-
 #pragma once
 
 #include <string>
@@ -251,6 +242,13 @@ public:
             close (fd_);
             fd_ = -1;
         }
+    }
+
+    int ReleaseFd() noexcept
+    {
+        int fd = fd_;
+        fd_ = -1;
+        return fd;
     }
 
 private:
