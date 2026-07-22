@@ -45,36 +45,46 @@ set(INFRA_HEADERS
     async_logger/logger.h
 )
 
-# 全量头文件（multi_reactor_http 使用）
-set(ALL_HEADERS ${CORE_HEADERS} ${HTTP_HEADERS} ${INFRA_HEADERS})
+# 模块化架构：TcpConnection + SubReactor + TcpServer（Day 19）
+set(MODULAR_HEADERS
+    tcp_connection.h
+    sub_reactor.h
+    tcp_server.h
+)
+
+# 全量头文件
+set(ALL_HEADERS ${CORE_HEADERS} ${HTTP_HEADERS} ${INFRA_HEADERS} ${MODULAR_HEADERS})
 
 # ==========================================================
 # 可执行目标
 # ==========================================================
 
 # ---- 基础 TCP Echo ----
-add_executable(tcp_server tcp_server.cpp "tcp_server.h" "v1_http_server.cpp")
-add_executable(tcp_client tcp_client.cpp "tcp_server.h" "v1_http_server.cpp")
+add_executable(tcp_server tcp_server.cpp)
+add_executable(tcp_client tcp_client.cpp)
 
 # ---- Epoll Echo Server（LT / 封装 / Buffer）----
-add_executable(epoll_echo_server    epoll_echo_server.cpp    ${CORE_HEADERS} "tcp_server.h" "v1_http_server.cpp")
-add_executable(epoll_echo_server_v2 epoll_echo_server_v2.cpp ${CORE_HEADERS} "tcp_server.h" "v1_http_server.cpp")
-add_executable(epoll_echo_server_v3 epoll_echo_server_v3.cpp ${CORE_HEADERS} "tcp_server.h" "v1_http_server.cpp")
+add_executable(epoll_echo_server    epoll_echo_server.cpp    ${CORE_HEADERS})
+add_executable(epoll_echo_server_v2 epoll_echo_server_v2.cpp ${CORE_HEADERS})
+add_executable(epoll_echo_server_v3 epoll_echo_server_v3.cpp ${CORE_HEADERS})
 
 # ---- Reactor Echo Server（单 / 主从）----
-add_executable(single_reactor_server single_reactor_server.cpp ${CORE_HEADERS} "tcp_server.h" "v1_http_server.cpp")
-add_executable(multi_reactor_server  multi_reactor_server.cpp  ${CORE_HEADERS} "tcp_server.h" "v1_http_server.cpp")
+add_executable(single_reactor_server single_reactor_server.cpp ${CORE_HEADERS})
+add_executable(multi_reactor_server  multi_reactor_server.cpp  ${CORE_HEADERS})
 
 # ---- HTTP Server ----
-add_executable(single_reactor_http single_reactor_http.cpp ${CORE_HEADERS} ${HTTP_HEADERS} "tcp_server.h" "v1_http_server.cpp")
-add_executable(multi_reactor_http  multi_reactor_http.cpp  ${ALL_HEADERS} "tcp_server.h" "v1_http_server.cpp")
+add_executable(single_reactor_http single_reactor_http.cpp ${CORE_HEADERS} ${HTTP_HEADERS})
+add_executable(multi_reactor_http  multi_reactor_http.cpp  ${ALL_HEADERS})
+
+# ---- HTTP Server v1.0（模块化架构，Day 19）----
+add_executable(v1_http_server v1_http_server.cpp ${ALL_HEADERS})
 
 # ---- HTTP Server 参考版（reference 目录下的完整实现）----
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/reference/multi_reactor_http_full.cpp")
     add_executable(multi_reactor_http_full
         reference/multi_reactor_http_full.cpp
         ${ALL_HEADERS}
-     "tcp_server.h" "v1_http_server.cpp")
+    )
 endif()
 
 # ---- 所有目标统一链接 ----
@@ -84,6 +94,7 @@ set(ALL_TARGETS
     epoll_echo_server epoll_echo_server_v2 epoll_echo_server_v3
     single_reactor_server multi_reactor_server
     single_reactor_http multi_reactor_http
+    v1_http_server
 )
 foreach(target IN LISTS ALL_TARGETS)
     target_link_libraries(${target} PRIVATE Threads::Threads)
@@ -102,5 +113,13 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/www"
         "$<TARGET_FILE_DIR:multi_reactor_http>/www"
-    COMMENT "Copying www/ → build dir"
+    COMMENT "Copying www/ → multi_reactor_http build dir"
+)
+
+add_custom_command(
+    TARGET v1_http_server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/www"
+        "$<TARGET_FILE_DIR:v1_http_server>/www"
+    COMMENT "Copying www/ → v1_http_server build dir"
 )
