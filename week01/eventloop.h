@@ -1,3 +1,5 @@
+#pragma once
+
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <atomic>

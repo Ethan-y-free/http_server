@@ -3,6 +3,8 @@
 #include "http_static_handler.h"
 #include "async_logger/logger.h"
 
+AsyncLogWriter* g_logWriter = nullptr;
+
 int main()
 {
     AsyncLogWriter logWriter("server.log");

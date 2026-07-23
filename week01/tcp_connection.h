@@ -49,7 +49,7 @@ public:
 
     void Send(const void* data, size_t len)
     {
-        outputBuffer_.Append(data, len);
+        outputBuffer_.Append(static_cast<const char*>(data), len);
         OnWrite();
     }
 

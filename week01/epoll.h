@@ -120,7 +120,12 @@ public:
 
         if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) < 0)
         {
-            throw std::runtime_error(std::string("epoll_ctl(MOD) fd=") + std::to_string(fd) + " failed: " + std::strerror(errno));
+            // ENOENT: fd 已被内核移出 epoll（如 fd 复用后被 close 了）
+            // 仅打印警告，不抛异常
+            if (errno != ENOENT)
+            {
+                throw std::runtime_error(std::string("epoll_ctl(MOD) fd=") + std::to_string(fd) + " failed: " + std::strerror(errno));
+            }
         }
     }
 
@@ -130,7 +135,12 @@ public:
     {
         if (epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr) < 0)
         {
-            throw std::runtime_error(std::string("epoll_ctl(DEL) fd=") + std::to_string(fd) + " failed: " + std::strerror(errno));
+            // ENOENT: fd 已不在 epoll 中（重复 DEL 或已被内核移除）
+            // EBADF:  fd 已被关闭（Deferred deletion 期间 Socket 析构先于 Channel）
+            if (errno != ENOENT && errno != EBADF)
+            {
+                throw std::runtime_error(std::string("epoll_ctl(DEL) fd=") + std::to_string(fd) + " failed: " + std::strerror(errno));
+            }
         }
     }
 

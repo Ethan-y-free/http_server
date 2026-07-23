@@ -37,9 +37,9 @@ public:
         thread_ = std::thread([this]()
             {
                 Logger::SetCurrentLogBuffer(logBuffer_.get());
-                SetupTimer();
                 loop_->Loop();
             });
+        loop_->RunInLoop([this]() { SetupTimer(); });
     }
 
     void Stop()
@@ -58,10 +58,15 @@ public:
                 auto conn = std::make_unique<TcpConnection>(fd, loop_.get());
 
                 conn->SetMessageCallback(onMessage);
-                conn->SetCloseCallback([this](TcpConnection* c) 
+                conn->SetCloseCallback([this](TcpConnection* c)
                     {
                         timerWheel_->Remove(c->Fd());
-                        connections_.erase(c->Fd());
+                        int fd = c->Fd();
+                        // 延迟删除：避免在 HandleEvent 调用栈内析构 Channel（use-after-free）
+                        loop_->QueueInLoop([this, fd]() 
+                        {
+                            connections_.erase(fd);
+                        });
                     });
 
                 timerWheel_->AddOrRefresh(fd, idleTimeoutMs_);

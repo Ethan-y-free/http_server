@@ -59,7 +59,8 @@ private:
     {
         int idx = roundRobin_.fetch_add(1) % config_.subReactorCount;
 
-        Socket clientSock = listenSock_.Accept();      
+        Socket clientSock = listenSock_.Accept();
+        clientSock.SetNonBlocking();
         int clientFd = clientSock.ReleaseFd();         
         subReactors_[idx]->AddConnection(clientFd, config_.onMessage);
     } 
