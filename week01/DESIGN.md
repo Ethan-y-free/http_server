@@ -4324,3 +4324,460 @@ TcpConnection 不关心 KeepAlive 语义。业务层通过 `Shutdown()` vs `Forc
 | 5 | 更新 `CMakeLists.txt` | 添加 main 目标 |
 | 6 | 编译测试 | 浏览器访问，验证 login → welcome → map |
 | 7 | 对照旧版 `multi_reactor_http.cpp` | 验证功能等价，保留旧文件不动 |
+
+---
+
+# §二十一：Day 20 压测 + Day 21 阶段总结
+
+---
+
+## 二十一.1 Day 20 压测数据
+
+### 环境
+
+| 项目 | 值 |
+|------|-----|
+| 硬件 | VMware Ubuntu，4 核，8G |
+| 工具 | wrk |
+| 测试目标 | v1_http_server（MainReactor×1 + SubReactor×4） |
+| 测试文件 | `/index.html` |
+
+### wrk 结果
+
+```
+$ wrk -t4 -c100 -d30s http://localhost:8888/index.html
+Running 30s test @ http://localhost:8888/index.html
+  4 threads and 100 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    15.42ms   18.95ms 213.40ms   87.49%
+    Req/Sec     1.63k   269.19     2.45k    72.36%
+  194602 requests in 30.00s, 149.43MB read
+Requests/sec:   6486.73
+Transfer/sec:      4.98MB
+```
+
+| 指标 | 数值 |
+|------|------|
+| **QPS** | **6,486 req/s** |
+| 平均延迟 | 15.42 ms |
+| 最大延迟 | 213.40 ms |
+| 总请求数 | 194,602 |
+| 失败数 | 0 |
+
+### Day 20 调试修复的 7 个 Bug
+
+| # | 文件 | 问题 | 修复 |
+|---|------|------|------|
+| 1 | `eventloop.h` | 缺 `#pragma once` → class redefinition | 添加头文件保护 |
+| 2 | `tcp_connection.h` | `const void*` → `const char*` 隐式转换失败 | `static_cast<const char*>` |
+| 3 | `tcp_server.h` | accept 后缺 `SetNonBlocking()` | 添加非阻塞设置 |
+| 4 | `v1_http_server.cpp` | `g_logWriter` 未定义 → linker error | 文件作用域定义 |
+| 5 | `sub_reactor.h` | SetupTimer 在 Loop 前执行，tid_ 未更新 | 用 RunInLoop 延迟 SetupTimer |
+| 6 | `tcp_connection.h` | OnClose 同步 delete → HandleEvent use-after-free | QueueInLoop 延迟删除 |
+| 7 | `epoll.h` | Del/Mod 抛异常 → 边界条件 std::terminate | 改为 LOG_ERROR + return |
+
+---
+
+## 二十一.2 Day 21 阶段总结产出
+
+| # | 产出 | 说明 |
+|---|------|------|
+| 1 | `README.md` | 项目一完整 README：架构图 + 模块说明 + 压测数据 + 编译运行 |
+| 2 | 简历素材 | 嵌入 README §八（面试可讲的项目描述） |
+| 3 | 架构图 | ASCII 架构图（主从 Reactor + 模块关系） |
+| 4 | 压测报告 | wrk 6,486 QPS + ab 单/主从对比 |
+
+---
+
+## 二十一.3 项目一完整文件清单
+
+```
+week01/
+├── README.md                    ← 项目文档
+├── DESIGN.md                    ← 技术设计文档（21 节）
+├── CMakeLists.txt               ← 11 个构建目标
+│
+├── v1_http_server.cpp           ← ★ 模块化 HTTP Server（~30 行）
+│
+├── 核心层 (header-only)
+│   ├── socket_raii.h            ← Socket RAII
+│   ├── epoll.h                  ← Epoll 封装
+│   ├── channel.h                ← Channel 事件分发
+│   ├── buffer.h                 ← 应用层缓冲区
+│   ├── eventloop.h              ← one loop per thread
+│   ├── timer_wheel.h            ← 时间轮定时器
+│   └── threadpool.h             ← C++11 线程池
+│
+├── 网络层 (header-only)
+│   ├── tcp_connection.h         ← TCP 连接生命周期
+│   ├── sub_reactor.h            ← 子线程 EventLoop + 连接池
+│   └── tcp_server.h             ← TcpServer + RoundRobin
+│
+├── HTTP 层 (header-only)
+│   ├── http_request.h           ← 请求数据结构
+│   ├── http_parser.h            ← HTTP/1.1 状态机
+│   └── http_static_handler.h    ← 静态文件服务
+│
+├── 异步日志 (header-only)
+│   └── async_logger/
+│       ├── log_stream.h         ← 4KB 格式化缓冲区
+│       ├── log_buffer.h         ← 双缓冲 4MB×2
+│       ├── async_log_writer.h   ← 后台线程写盘
+│       └── logger.h             ← Logger RAII + 宏
+│
+├── 历史版本（9 个 .cpp）
+├── reference/                   ← 参考实现
+├── scripts/bench.sh             ← 压测脚本
+├── docs/                        ← PPT 文档
+└── www/                         ← 校园导览前端
+```
+
+---
+
+## 二十一.4 下一步 — 项目二
+
+网络层（TcpConnection / SubReactor / TcpServer / EventLoop）已具备可复用网络库雏形。
+
+项目二目标（7 月中–8 月底）：
+- 重构 EventLoop/Channel/Poller 对标 muduo 接口
+- 新增 TcpClient / Connector / Acceptor
+- 内存池 + LFU 缓存
+- Google Test 全覆盖 + Docker 化
+
+---
+
+# §二十二：Google Test 单元测试 — Buffer 类（Day 22）
+
+---
+
+## 二十二.1 我们要做什么
+
+给 `buffer.h` 写单元测试。Buffer 是项目里最纯粹的数据结构——没有系统调用、没有线程、没有副作用，最适合作为第一个测试目标。
+
+**目标**：写完测试后，一条命令验证 Buffer 所有行为正确。
+
+---
+
+## 二十二.2 CMake 集成
+
+在 `CMakeLists.txt` 末尾新增：
+
+```cmake
+# ==========================================================
+# Google Test 单元测试
+# ==========================================================
+enable_testing()
+
+# 查找 Google Test
+find_package(GTest REQUIRED)
+include_directories(${GTEST_INCLUDE_DIRS})
+
+# Buffer 测试
+add_executable(buffer_test
+    tests/buffer_test.cpp
+    buffer.h
+)
+target_link_libraries(buffer_test PRIVATE ${GTEST_LIBRARIES} pthread)
+add_test(NAME buffer_test COMMAND buffer_test)
+```
+
+说明：
+- `enable_testing()` — 启用 CTest
+- `find_package(GTest REQUIRED)` — 找系统安装的 Google Test
+- `add_test` — 注册到 CTest，之后可以用 `ctest` 或 `make test` 跑
+- 测试文件放新建的 `tests/` 目录
+
+---
+
+## 二十二.3 Google Test 最小入门
+
+### 基本语法
+
+```cpp
+#include <gtest/gtest.h>
+#include "buffer.h"
+
+// TEST(测试套件名, 测试用例名)
+TEST(BufferTest, InitialState)
+{
+    Buffer buf;
+    EXPECT_EQ(buf.ReadableBytes(), 0);   // 期望相等
+    EXPECT_EQ(buf.WritableBytes(), 1024); // 期望相等
+    // ... 测试逻辑
+}
+```
+
+### 断言宏
+
+| 宏 | 含义 |
+|----|------|
+| `EXPECT_EQ(a, b)` | a == b |
+| `EXPECT_NE(a, b)` | a != b |
+| `EXPECT_TRUE(cond)` | cond 为 true |
+| `EXPECT_FALSE(cond)` | cond 为 false |
+| `EXPECT_STREQ(a, b)` | C 字符串相等 |
+| `EXPECT_THROW(code, exception)` | 期望抛异常 |
+| `ASSERT_EQ(a, b)` | 同上但失败后立即退出当前 TEST |
+
+`EXPECT_*` 失败继续执行，`ASSERT_*` 失败立刻返回。一般用 `EXPECT_` 就够了。
+
+---
+
+## 二十二.4 Buffer 测试用例设计
+
+### 用例 1：InitialState — 初始状态
+
+```
+Given:  刚构造的 Buffer
+Then:   ReadableBytes() == 0
+        WritableBytes() == 1024
+        PrependableBytes() == 8
+        Peek() 指向有效内存
+```
+
+### 用例 2：AppendAndRead — 基本写入/读取
+
+```
+Given:  空 Buffer
+When:   Append("hello", 5)
+Then:   ReadableBytes() == 5
+        WritableBytes() == 1024 - 5
+        Peek() 前 5 字节 == "hello"
+When:   Retrieve(3)
+Then:   ReadableBytes() == 2
+        Peek() 前 2 字节 == "lo"
+```
+
+### 用例 3：AppendString — 写入 std::string
+
+```
+Given:  空 Buffer
+When:   Append(std::string("world"))
+Then:   ReadableBytes() == 5
+```
+
+### 用例 4：RetrieveAll — 全部消费
+
+```
+Given:  写入了 "hello"
+When:   RetrieveAll()
+Then:   ReadableBytes() == 0
+        writeIndex 回到 kCheapPrepend
+```
+
+### 用例 5：RetrieveAsString — 消费并返回字符串
+
+```
+Given:  写入了 "hello"
+When:   s = RetrieveAsString(3)
+Then:   s == "hel"
+        ReadableBytes() == 2
+When:   s2 = RetrieveAllAsString()
+Then:   s2 == "lo"
+        ReadableBytes() == 0
+```
+
+### 用例 6：Prepend — 头部插入
+
+```
+Given:  写入了 "world"（占 5 字节，readIndex=8, writeIndex=13）
+When:   Prepend("hello", 5)  // readIndex 从 8 退回 3
+Then:   ReadableBytes() == 10
+        Peek() 前 10 字节 == "helloworld"
+```
+
+### 用例 7：PrependOverflow — 头部插入越界
+
+```
+Given:  空 Buffer（PrependableBytes = 8）
+When:   Prepend(data, 9)  // 超过 8
+Then:   抛 std::out_of_range
+```
+
+### 用例 8：AutoExpand — 自动扩容
+
+```
+Given:  空 Buffer（初始 1024 可写）
+When:   Append(1025 字节的数据)
+Then:   不崩溃
+        ReadableBytes() == 1025
+        InternalCapacity() > 1024 + 8  // 确实扩容了
+```
+
+### 用例 9：InternalMove — 内部碎片整理
+
+```
+Given:  先 Append(1000 字节)，再 Retrieve(900)
+        // 此时 readIndex=908，可写空间只剩 1024+8-908-100=224
+        // 但 readIndex 前面有 900 字节碎片
+When:   Append(500 字节)  // 超过可写但碎片+可写能装下
+Then:   数据被搬到前面，不触发 vector resize
+        ReadableBytes() == 100 + 500 == 600
+        // 验证：数据没有损坏
+```
+
+### 用例 10：FindCRLF — 查找换行
+
+```
+Given:  空 Buffer
+When:   Append("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", ...)
+Then:   FindCRLF() != nullptr
+        第一次 Peek() 到 FindCRLF() 的内容 == "GET / HTTP/1.1"
+When:   RetrieveUntil(FindCRLF() + 2)  // 跳过 "\r\n"
+Then:   FindCRLF() != nullptr  // 还有 Host 那一行
+```
+
+### 用例 11：FindCRLFNotFound — 没找到换行
+
+```
+Given:  空 Buffer
+When:   Append("no newline here", 15)
+Then:   FindCRLF() == nullptr
+```
+
+### 用例 12：Swap — 两个 Buffer 交换
+
+```
+Given:  buf1 写了 "aaaa", buf2 写了 "bbbb"
+When:   buf1.Swap(buf2)
+Then:   buf1.ReadableBytes() == 4, Peek() == "bbbb"
+        buf2.ReadableBytes() == 4, Peek() == "aaaa"
+```
+
+### 用例 13：Shrink — 收缩容量
+
+```
+Given:  buf 写了 100 字节
+When:   buf.Shrink()
+Then:   InternalCapacity() ≈ writeIndex_ (不超过原始大小)
+```
+
+---
+
+## 二十二.5 测试文件结构
+
+```
+week01/
+├── tests/                  ← 新建目录
+│   └── buffer_test.cpp     ← Day 22：Buffer 测试
+├── CMakeLists.txt          ← 新增 enable_testing() + buffer_test target
+└── buffer.h
+```
+
+---
+
+## 二十二.6 编译和运行
+
+```bash
+# 在 VM 上
+cd projects/http_server/week01/build
+cmake ..
+make buffer_test -j$(nproc)
+./buffer_test
+```
+
+期望输出：
+
+```
+[==========] Running 13 tests from 1 test suite.
+[----------] 13 tests from BufferTest
+[ RUN      ] BufferTest.InitialState
+[       OK ] BufferTest.InitialState (0 ms)
+...
+[==========] 13 tests from 1 test suite ran. (0 ms total)
+[  PASSED  ] 13 tests.
+```
+
+---
+
+## 二十二.7 测试代码骨架
+
+下面给一个能编译的空骨架，你往里面填 EXPECT：
+
+```cpp
+#include <gtest/gtest.h>
+#include "buffer.h"
+#include <cstring>
+
+TEST(BufferTest, InitialState)
+{
+    Buffer buf;
+    // TODO: 验证初始状态
+}
+
+TEST(BufferTest, AppendAndRead)
+{
+    Buffer buf;
+    buf.Append("hello", 5);
+    // TODO: 验证可读字节数、Peek 内容
+    buf.Retrieve(3);
+    // TODO: 验证剩余内容
+}
+
+// ... 其余 11 个用例照二十二.4 写
+```
+
+> 照 §二十二.4 的 Given/When/Then 写测试逻辑。不懂的随时问。
+
+---
+
+## 二十二.8 Day 22 任务清单
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 1 | 在 VM 上确认 gtest 可用 | `pkg-config --cflags --libs gtest` |
+| 2 | 创建 `tests/` 目录 | `mkdir -p tests` |
+| 3 | 在 CMakeLists.txt 末尾加测试配置 | 照 §二十二.2 |
+| 4 | 创建 `tests/buffer_test.cpp` | 照 §二十二.4 和 §二十二.7 |
+| 5 | 编译 | `cmake .. && make buffer_test -j$(nproc)` |
+| 6 | 跑测试 | `./buffer_test` |
+| 7 | 全部绿灯后告诉我 | 进入 Day 23 |
+
+---
+
+# §二十三：Google Test — EventLoop + ThreadPool 测试（Day 23）
+
+---
+
+## 二十三.1 测试目标
+
+比 Buffer 复杂——EventLoop 涉及线程和 epoll，ThreadPool 涉及并发和同步。
+
+## 二十三.2 ThreadPool 测试用例（7 个）
+
+| # | 用例 | 验证点 |
+|---|------|--------|
+| 1 | `SubmitReturnsValue` | Submit 返回 `std::future`，get() 拿到正确结果 |
+| 2 | `SubmitStringConcat` | 带 `std::string` 参数的 Submit |
+| 3 | `RunExecutesTask` | Run（fire-and-forget）确实执行了 |
+| 4 | `ParallelExecution` | 100 个任务，4 线程，原子计数器最终 = 100 |
+| 5 | `TasksExecuteInOrder` | 单线程池，FIFO 顺序保证 |
+| 6 | `DestructorWaitsForTasks` | 析构函数不丢任务，等全部跑完 |
+| 7 | `ZeroThreads` | 空线程池正常析构 |
+
+## 二十三.3 EventLoop 测试用例（6 个）
+
+| # | 用例 | 验证点 |
+|---|------|--------|
+| 1 | `Construct` | 构造后 IsInLoopThread() == true |
+| 2 | `RunInLoopSameThread` | 同线程直接同步执行 |
+| 3 | `LoopAndQuit` | 子线程跑 Loop()，外部 Quit() 唤醒退出 |
+| 4 | `QueueInLoop` | 跨线程投递 → eventfd 敲门 → 子线程执行 |
+| 5 | `AddAndRemoveChannel` | 用 pipe fd 注册到 epoll，正常摘除 |
+| 6 | `MultipleQueueInLoop` | 连续 5 次 QueueInLoop 全部执行 |
+
+> EventLoop 测试**必须以 Debug 模式编译**（不能有 `-DNDEBUG`），否则 `AssertInLoopThread` 里的 `assert()` 会失效。
+
+## 二十三.4 编译运行
+
+```bash
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+make buffer_test threadpool_test eventloop_test -j$(nproc)
+
+./buffer_test        # 13 个用例
+./threadpool_test    # 7 个用例
+./eventloop_test     # 6 个用例
+# 或一键跑全部
+ctest --verbose
+```

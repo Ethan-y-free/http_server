@@ -24,14 +24,19 @@ public:
 
     ~TcpServer()
     {
-        mainLoop_.RemoveChannel(listenChannel_.get());
-        listenSock_.Close();  
-
-        for (int i = 0; i < config_.subReactorCount; ++i)
+        // 析构顺序：先停子线程，再释放资源
+        // mainLoop_.Loop() 在 Start() 中退出后才走到析构，所以无需再次 Quit
+        for (size_t i = 0; i < subReactors_.size(); ++i)
         {
             subReactors_[i]->Stop();
         }
+        listenChannel_.reset();   // Channel 析构 → DisableAll() → epoll Del
+        listenSock_.Close();      // 关闭监听 fd
+    }
 
+    // 从其他线程调用，唤醒 mainLoop_ 的 epoll_wait 实现优雅关闭
+    void Quit()
+    {
         mainLoop_.Quit();
     }
 

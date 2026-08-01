@@ -124,7 +124,6 @@ private:
         std::cout << "[recv " << n << "B fd=" << fd << "] " << msg << std::endl;
 
         conn.outputBuffer.Append(conn.inputBuffer.Peek(), conn.inputBuffer.ReadableBytes());
-        size_t len = conn.inputBuffer.ReadableBytes();
         conn.inputBuffer.RetrieveAll();
 
         pool_->Run([this, fd]()

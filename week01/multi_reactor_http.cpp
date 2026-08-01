@@ -136,7 +136,7 @@ public:
 			mainLoop_->RemoveChannel(listen_channel_.get());
 		}
 
-		for (int i = 0; i < subLoops_.size(); ++i)
+		for (size_t i = 0; i < subLoops_.size(); ++i)
 		{
 			if (timerChannels_[i])
 			{
@@ -160,7 +160,7 @@ public:
 			}
 		}
 
-		for (int i = 0; i < subLoops_.size(); ++i)
+		for (size_t i = 0; i < subLoops_.size(); ++i)
 		{
 			if (timerFds_[i] >= 0)
 				::close(timerFds_[i]);

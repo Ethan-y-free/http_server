@@ -123,3 +123,32 @@ add_custom_command(
         "$<TARGET_FILE_DIR:v1_http_server>/www"
     COMMENT "Copying www/ → v1_http_server build dir"
 )
+
+# ==========================================================
+# Google Test 单元测试
+# ==========================================================
+enable_testing()
+
+find_package(GTest REQUIRED)
+include_directories(${GTEST_INCLUDE_DIRS})
+
+add_executable(buffer_test
+    tests/buffer_test.cpp
+    buffer.h
+)
+target_link_libraries(buffer_test PRIVATE GTest::gtest_main pthread)
+add_test(NAME buffer_test COMMAND buffer_test)
+
+add_executable(threadpool_test
+    tests/threadpool_test.cpp
+    threadpool.h
+)
+target_link_libraries(threadpool_test PRIVATE GTest::gtest_main pthread)
+add_test(NAME threadpool_test COMMAND threadpool_test)
+
+add_executable(eventloop_test
+    tests/eventloop_test.cpp
+    ${CORE_HEADERS}
+)
+target_link_libraries(eventloop_test PRIVATE GTest::gtest_main pthread)
+add_test(NAME eventloop_test COMMAND eventloop_test)

@@ -9,7 +9,7 @@
 class LogBuffer
 {
 public:
-	explicit LogBuffer(AsyncLogWriter* writer) : writer_(writer), current_(kBufferSize), next_(kBufferSize)
+	explicit LogBuffer(AsyncLogWriter* writer) : current_(kBufferSize), next_(kBufferSize), writer_(writer)
 	{
 		current_.clear(), next_.clear();
 	}
