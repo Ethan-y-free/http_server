@@ -318,7 +318,55 @@ conn->SetCloseCallback([this](TcpConnection* c) {
 
 ---
 
-## 八、简历素材
+## 八、测试与质量保障
+
+### 8.1 单元测试（Google Test）
+
+| 测试目标 | 用例数 | 覆盖范围 |
+|----------|--------|----------|
+| `buffer_test` | 13 | Buffer 读写、扩容、边界、ReadFd |
+| `threadpool_test` | 7 | 任务提交、返回值、异常安全、关闭 |
+| `eventloop_test` | 6 | RunInLoop、QueueInLoop、跨线程唤醒 |
+
+```bash
+cd build && cmake .. && make buffer_test threadpool_test eventloop_test -j$(nproc)
+./buffer_test && ./threadpool_test && ./eventloop_test
+# 26/26 tests passed ✅
+```
+
+### 8.2 GDB 调试实战（Day 24）
+
+- **crash_demo**：构造 SIGSEGV 崩溃，用 `bt full` + `frame N` + `info locals` 定位空指针解引用
+- **v1_http_server 在线调试**：`gdb ./v1_http_server` → `catch syscall epoll_wait` → 设断点 `OnAccept` / `OnRead` / `OnClose` → 对比主/子线程调用栈 → 验证 one loop per thread
+
+### 8.3 Valgrind 内存检测（Day 25）
+
+```bash
+valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./v1_http_server
+```
+
+| 类别 | 结果 |
+|------|------|
+| `definitely lost` | **0 bytes** ✅ |
+| `indirectly lost` | **0 bytes** ✅ |
+| `possibly lost` | **0 bytes** ✅ |
+| `still reachable` | **0 bytes** ✅ |
+| 总分配/释放 | 97 allocs / 97 frees — 100% 释放 |
+
+### 8.4 优雅关闭（SIGINT Graceful Shutdown）
+
+```
+Ctrl+C → pthread_sigmask 阻塞 SIGINT → sigwait 线程截获 → server.Quit()
+  → mainLoop_.Quit() → epoll 唤醒 → Loop 退出 → Start 返回
+    → ~SubReactor (×4) → join 子线程 → 释放 connections_ → 释放 32MB LogBuffer
+      → ~AsyncLogWriter → 刷盘剩余日志 → fclose
+```
+
+关键坑：`pthread_sigmask` 必须在所有 `std::thread` 创建之前调用，否则子线程不继承信号掩码。
+
+---
+
+## 九、简历素材
 
 > **高并发 HTTP 服务器** | C++17, epoll, Reactor 模式
 >
@@ -328,11 +376,13 @@ conn->SetCloseCallback([this](TcpConnection* c) {
 > - 双缓冲异步日志系统（4MB×2），后台线程集中写盘，IO 线程零阻塞
 > - RoundRobin 无锁分发连接（std::atomic），QueueInLoop 延迟删除保障线程安全
 > - 修复 7 个编译/运行时 bug（use-after-free、ET 阻塞、事件循环断言等）
+> - 实现 SIGINT 优雅关闭（pthread_sigmask + sigwait），Valgrind 零泄漏（97 alloc / 97 free）
+> - GDB 调试实战：crash_demo 崩溃定位 + v1_http_server 在线断点调试
 > - wrk 压测 6,486 QPS（4 核 8G VM，100 并发，零失败）
 
 ---
 
-## 九、学习笔记
+## 十、学习笔记
 
 完整开发笔记见 `projects/notes/c++ http服务器开发.txt`，涵盖：
 - Socket API 逐函数精讲
@@ -343,9 +393,9 @@ conn->SetCloseCallback([this](TcpConnection* c) {
 
 ---
 
-## 十、下一步
+## 十一、下一步
 
-本项目的网络层（TcpConnection / SubReactor / TcpServer / EventLoop）已具备**可复用网络库雏形**。
+本项目的网络层（TcpConnection / SubReactor / TcpServer / EventLoop）已具备**可复用网络库雏形**。项目一所有 28 天计划全部完成 ✅。
 
 **项目二**（计划 7 月中–8 月底）：仿 muduo 高性能网络库
 - 重构 EventLoop/Channel/Poller 对标 muduo 接口

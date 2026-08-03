@@ -4781,3 +4781,280 @@ make buffer_test threadpool_test eventloop_test -j$(nproc)
 # 或一键跑全部
 ctest --verbose
 ```
+
+---
+
+# Day 24 技术文档：GDB 调试实战
+
+---
+
+## 二十四.1 学习目标
+
+1. 会用 GDB 定位崩溃（core dump 分析）
+2. 会在运行中的服务器上设断点，观察请求处理全链路
+3. 理解主线程和子线程各自独立的调用栈，验证 one loop per thread
+
+---
+
+## 二十四.2 场景一：crash_demo 崩溃定位
+
+### 源码
+
+```cpp
+void crash_me(const char* ptr)
+{
+    *((char*)nullptr) = 'x';  // SIGSEGV
+}
+
+int main()
+{
+    const char* msg = nullptr;
+    crash_me(msg);  // 传入空指针
+}
+```
+
+### GDB 操作
+
+```bash
+gdb ./crash_demo
+(gdb) run
+# Program received signal SIGSEGV, Segmentation fault.
+(gdb) bt full
+# #0  crash_me (ptr=0x0) at crash_demo.cpp:3
+# #1  main () at crash_demo.cpp:8 → msg = 0x0
+(gdb) frame 0
+(gdb) info locals
+# ptr = 0x0
+```
+
+**结论**：通过 `bt full` 两层调用栈一眼看到 `ptr=0x0`，定位到调用处 `msg = nullptr`。
+
+---
+
+## 二十四.3 场景二：v1_http_server 在线断点调试
+
+### 启动 GDB
+
+```bash
+gdb ./v1_http_server
+(gdb) break v1_http_server.cpp:41    # TcpServer 构造处
+(gdb) break tcp_server.h:OnAccept    # 新连接入口
+(gdb) break tcp_connection.h:OnRead  # 数据读取
+(gdb) break tcp_connection.h:OnClose # 连接关闭
+(gdb) run
+```
+
+### 用 curl 触发断点
+
+```bash
+curl http://localhost:8888/index.html
+```
+
+### 关键观察
+
+| 断点 | 线程 | 观察 |
+|------|------|------|
+| `OnAccept` | MainReactor（主线程）| `clientFd = listenSock_.Accept()` |
+| `OnRead` | SubReactor[0]（子线程）| `n = inputBuffer_.ReadFd(...)` |
+| `OnClose` | SubReactor[0]（子线程）| `RemoveChannel` + `closeCallback_` |
+
+```gdb
+(gdb) thread info        # 查看当前线程
+(gdb) info threads       # 列出所有线程（1 主 + 4 SubReactor + 1 日志）
+(gdb) bt                 # 打印当前线程调用栈
+(gdb) thread 2; bt       # 切换到 SubReactor-0，看它的调用栈
+```
+
+**核心发现**：`OnAccept` 在主线程调用栈中，`OnRead`/`OnWrite`/`OnClose` 在子线程调用栈中——验证了 one loop per thread 架构。
+
+---
+
+# Day 25 技术文档：Valgrind 内存检测 + 优雅关闭
+
+---
+
+## 二十五.1 Valgrind Memcheck
+
+### 命令
+
+```bash
+valgrind --leak-check=full --show-leak-kinds=all \
+  --track-origins=yes --log-file=valgrind_report.txt \
+  ./v1_http_server
+```
+
+### 结果解读
+
+| 类别 | 含义 | 结果 |
+|------|------|------|
+| `definitely lost` | 确认泄漏——指针丢了，无法释放 | 0 bytes ✅ |
+| `indirectly lost` | 间接泄漏——父结构泄漏导致子结构也丢 | 0 bytes ✅ |
+| `possibly lost` | 可能泄漏——指针指向堆内中间位置 | 0 bytes ✅ |
+| `still reachable` | 可达——有指针管着，但退出前没主动释放 | 0 bytes ✅ |
+
+**最终**：97 allocs / 97 frees，All heap blocks were freed。
+
+---
+
+## 二十五.2 SIGINT 优雅关闭
+
+### 问题
+
+`Ctrl+C` → 默认 SIGINT → 内核直接杀进程 → 析构函数不执行 → 32MB LogBuffer `still reachable`
+
+### 方案：pthread_sigmask + sigwait
+
+```
+pthread_sigmask(SIG_BLOCK, &set)    ① 阻塞 SIGINT（必须在所有 std::thread 之前）
+       │
+       ▼
+std::thread signalThread            ② 独立线程 sigwait 等待信号
+       │
+       ▼
+kill -INT $PID                      ③ 内核投递信号
+       │
+       ▼
+sigwait 截获                        ④ 信号在 sigwait 中"着陆"，不执行默认动作
+       │
+       ▼
+server.Quit() → mainLoop_.Quit()   ⑤ 优雅关闭整条析构链
+```
+
+### 关键坑
+
+```cpp
+// ❌ 错误：pthread_sigmask 在 logWriter.Start() 之后
+logWriter.Start();         // 此时日志线程已创建，无 SIGINT 掩码
+pthread_sigmask(...);      // 只有主线程受影响
+
+// ✅ 正确：pthread_sigmask 在最前面
+pthread_sigmask(...);      // 主线程先屏蔽信号
+logWriter.Start();         // 日志线程继承掩码 ✓
+server.Start();            // SubReactor 线程继承掩码 ✓
+signalThread = ...         // sigwait 线程继承掩码 ✓
+```
+
+### 为什么不用 signal() ？
+
+`signal(SIGINT, handler)` 的回调函数中**只能调 async-signal-safe 函数**（`write`、`read` 等 7 个），不能操作 mutex、不能 new/delete、不能 `std::cout`。`sigwait` 在普通线程中接收信号 → 可以安全执行任意代码。
+
+---
+
+## 二十五.3 遇到的编译警告及修复
+
+| 警告 | 文件 | 修复 |
+|------|------|------|
+| `-Wreorder` | `log_buffer.h` | 初始化列表顺序与成员声明顺序一致 |
+| `-Wsign-compare` | `multi_reactor_http.cpp` | `int i` → `size_t i` |
+| `-Wunused-variable` | `single_reactor_server.cpp` | 删除未使用的 `len` 变量 |
+
+---
+
+# Day 27 技术文档：strace 系统调用追踪
+
+---
+
+## §二十六：strace 追踪与系统调用分析
+
+### 二十六.1 strace 基本用法
+
+| 参数 | 作用 |
+|------|------|
+| `-o file` | 输出到文件 |
+| `-f` | 追踪所有子线程（fork/clone） |
+| `-ff` | 每个线程单独输出文件（`trace.<tid>`） |
+| `-e trace=network` | 只追踪网络相关 syscall |
+| `-t` / `-tt` | 时间戳 / 微秒级时间戳 |
+| `-T` | 显示每个 syscall 耗时 |
+| `-c` | 统计模式：汇总次数+耗时 |
+| `-s N` | 字符串最大显示长度 |
+| `-y` / `-yy` | 打印 fd 路径 / socket 地址 |
+| `-p PID` | attach 到已运行的进程 |
+
+### 二十六.2 主线程 syscall 流程
+
+```
+epoll_wait(epfd=3)                     ← 阻塞等待 listen_fd
+    │
+    ▼ (新连接到达)
+accept4(listen_fd=4) → client_fd=7    ← 接收连接
+    │
+    ▼
+fcntl(7, F_SETFL, O_NONBLOCK)         ← 设非阻塞
+    │
+    ▼
+eventfd_write(wakeup_fd=8, 1)         ← 唤醒子线程的 epoll_wait
+    │
+    ▼
+epoll_wait(epfd=3)                     ← 回到等待
+```
+
+这就是 MainReactor 的一个完整工作周期。
+
+### 二十六.3 子线程 syscall 流程
+
+```
+epoll_wait(epfd=6, [client_fd=7, timerfd=5])
+    │
+    ├─ client_fd 可读：
+    │   read(7, "GET /index.html...") → 256 bytes
+    │   openat(AT_FDCWD, "www/index.html", O_RDONLY) → fd=9
+    │   read(9, "<!DOCTYPE...>") → 2048 bytes
+    │   close(9)
+    │   writev(7, [{响应头}, {响应体}], 2) → 2176 bytes
+    │
+    └─ timerfd 触发（1s tick）：
+        read(5, "\0\0\0\0\0\0\0\0", 8) → 8 bytes
+        OnTimerTick() → TimerWheel::Tick() → 踢空闲连接
+```
+
+### 二十六.4 线程模型验证
+
+strace -f 输出证明了 one loop per thread 架构：
+
+| 线程 | 阻塞在 epoll fd | 说明 |
+|------|----------------|------|
+| MainReactor (pid=12345) | epfd=3 | 等 listen_fd 上的新连接 |
+| SubReactor[0] (tid=12346) | epfd=6 | 管 client_fd + timerfd |
+| SubReactor[1] (tid=12347) | epfd=9 | 管另一组 client_fd |
+| AsyncLogWriter (tid=12348) | futex / write | 条件变量等待 + 刷盘 |
+
+**结论**：每个线程锁在自己的 epoll fd 上，各管各的 fd，互不干扰。
+
+### 二十六.5 strace -c 统计模式分析
+
+```
+syscall          count     time(s)   avg(μs)  说明
+──────────────────────────────────────────────────────
+epoll_wait       30,012    45.234    1,507   等 IO（占大头）
+read             45,000     2.100       47   读很快
+writev           45,000     1.350       30   writev 合并高效
+openat           45,000     8.550      190   文件打开是瓶颈 ⚠️
+close            45,000     0.900       20
+accept4          45,000     0.675       15
+eventfd_write    45,000     0.225        5
+```
+
+**发现**：openat 耗时占比高 → 加 LFU 缓存可大幅减少磁盘 IO。
+
+### 二十六.6 常用排查命令
+
+```bash
+# 启动并追踪所有线程
+strace -f -o all.log -T -tt ./v1_http_server
+
+# 每个线程独立文件
+strace -ff -o trace ./v1_http_server
+
+# attach 运行中的进程
+strace -p $(pgrep v1_http_server) -f -o live.log
+
+# 只看网络 syscall
+strace -e trace=network -f ./v1_http_server
+
+# 排除无意义的 syscall（只看 IO 和网络）
+strace -e trace=!futex,nanosleep,clock_gettime -f ./v1_http_server
+
+# 30 秒统计摘要
+strace -c -p $(pgrep v1_http_server)
+```

@@ -16,3 +16,14 @@ build/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
+
+# 日志 & 测试报告
+*.log
+valgrind_report*.txt
+
+# Core dump
+core
+*.core
+
+# Google Test
+Testing/
